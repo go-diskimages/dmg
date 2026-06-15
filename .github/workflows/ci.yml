@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: native ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Build
+        run: CGO_ENABLED=0 go build ./...
+      - name: Test
+        run: |
+          CGO_ENABLED=0 go test ./... -coverprofile=cover.out -covermode=atomic
+          go tool cover -func=cover.out | tail -1
+      - name: Coverage gate
+        run: |
+          total=$(go tool cover -func=cover.out | awk '/^total:/ {sub(/%/,"",$3); print $3}')
+          echo "total coverage: ${total}%"
+          awk -v c="$total" 'BEGIN { if (c+0 < 100.0) { print "coverage below 100.0%"; exit 1 } }'
+
+  emulated:
+    name: emulated ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            image: debian:trixie
+            qemu_cpu: rv64,v=true,vlen=128
+          - arch: loong64
+            image: ghcr.io/loong64/debian:trixie
+            qemu_cpu: la464
+          - arch: ppc64le
+            image: debian:trixie
+            qemu_cpu: power9
+          - arch: s390x
+            image: debian:trixie
+            qemu_cpu: qemu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Set up binfmt (QEMU)
+        run: docker run --privileged --rm tonistiigi/binfmt --install all
+      - name: Cross-compile per-package test binaries
+        run: |
+          set -euo pipefail
+          mkdir -p testbins
+          for pkg in $(go list ./...); do
+            name=$(echo "$pkg" | tr '/' '_')
+            echo "compiling test binary for $pkg"
+            CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} \
+              go test -c -cover -covermode=atomic -o "testbins/${name}.test" "$pkg" || {
+                # packages with no test files produce no binary; skip them
+                if [ ! -f "testbins/${name}.test" ]; then
+                  echo "no test binary for $pkg (likely no tests); skipping"
+                fi
+              }
+          done
+          ls -l testbins
+      - name: Run test binaries under QEMU
+        run: |
+          set -euo pipefail
+          # Run as a non-root user: several tests assert that operations on a
+          # read-only (0o500) directory fail, which root would bypass. The
+          # GitHub Actions workspace is world-writable, so a non-root container
+          # user can still write the coverprofile back into it.
+          chmod -R a+rwX testbins
+          for bin in testbins/*.test; do
+            [ -e "$bin" ] || continue
+            echo "::group::running $bin on ${{ matrix.arch }}"
+            docker run --rm --platform linux/${{ matrix.arch }} \
+              --user 1000:1000 \
+              -e QEMU_CPU='${{ matrix.qemu_cpu }}' \
+              -e TMPDIR=/tmp \
+              -v "$PWD":/w -w /tmp \
+              ${{ matrix.image }} \
+              "/w/$bin" -test.v -test.coverprofile="/w/${bin}.cover"
+            echo "::endgroup::"
+          done
+      - name: Coverage gate (emulated)
+        run: |
+          set -euo pipefail
+          echo "mode: atomic" > cover.out
+          for f in testbins/*.test.cover; do
+            [ -e "$f" ] || continue
+            tail -n +2 "$f" >> cover.out
+          done
+          go tool cover -func=cover.out | tail -1
+          total=$(go tool cover -func=cover.out | awk '/^total:/ {sub(/%/,"",$3); print $3}')
+          echo "total coverage: ${total}%"
+          awk -v c="$total" 'BEGIN { if (c+0 < 100.0) { print "coverage below 100.0%"; exit 1 } }'
