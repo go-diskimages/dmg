@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-diskimages/brand/main/social/go-diskimages-dmg.png" alt="go-diskimages/dmg" width="720"></p>
+
 # dmg
 
 Pure-Go Apple UDIF disk image helpers. No external tools (`hdiutil`, `plutil`) required. Works on all platforms.
