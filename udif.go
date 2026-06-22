@@ -54,7 +54,19 @@ const (
 	kolyBlockSize  = 512
 	udifSectorSize = 512
 	blkxMagic      = uint32(0x6D697368) // 'mish'
-	blkxHeaderSize = 200
+	// blkxHeaderSize is the size of the UDIF BLKXTable (mish) header that
+	// precedes the 40-byte chunk-run entries. The Apple/UDIF layout is:
+	//   [0:4]    Signature 'mish'        [4:8]   Version (1)
+	//   [8:16]   SectorNumber            [16:24] SectorCount
+	//   [24:32]  DataOffset              [32:36] BuffersNeeded
+	//   [36:40]  BlockDescriptors        [40:64] reserved (6×uint32)
+	//   [64:200] UDIFChecksum: type[64:68] + size[68:72] + data[72:200]
+	//   [200:204] BlocksRunCount
+	//   [204:…]  run entries (40 bytes each)
+	// This MUST be 204 (not 200): qemu-img's block/dmg.c reads the run count
+	// at +200 and the first chunk at +204; emitting a 200-byte header shifts
+	// every chunk field by 4 bytes and makes the image unreadable.
+	blkxHeaderSize = 204
 
 	blkxNocopy = uint32(0x00000000) // zero-fill, no stored data
 	blkxRaw    = uint32(0x00000001) // raw / uncompressed
@@ -174,7 +186,7 @@ func parseBlkxTable(b []byte) (blkxTable, []blkxRun, error) {
 	if binary.BigEndian.Uint32(b[0:4]) != blkxMagic {
 		return blkxTable{}, nil, fmt.Errorf("blkx: bad magic")
 	}
-	n := int(binary.BigEndian.Uint32(b[36:40]))
+	n := int(binary.BigEndian.Uint32(b[200:204])) // BlocksRunCount
 	if len(b) < blkxHeaderSize+n*40 {
 		return blkxTable{}, nil, fmt.Errorf("blkx: buffer too small for %d runs", n)
 	}
@@ -206,11 +218,12 @@ func writeBlkxTable(t blkxTable, runs []blkxRun, checksum uint32) []byte {
 	binary.BigEndian.PutUint64(buf[8:16], t.sectorNumber)
 	binary.BigEndian.PutUint64(buf[16:24], t.sectorCount)
 	binary.BigEndian.PutUint64(buf[24:32], t.dataOffset)
-	binary.BigEndian.PutUint32(buf[36:40], uint32(len(runs)))
-	// checksum: [40:44]=type CRC-32, [44:48]=size 32, [48:52]=value
-	binary.BigEndian.PutUint32(buf[40:44], 0x00000002)
-	binary.BigEndian.PutUint32(buf[44:48], 0x00000020)
-	binary.BigEndian.PutUint32(buf[48:52], checksum)
+	// UDIFChecksum at [64:200]: type[64:68]=CRC-32, size[68:72]=32 bits, data[72:76]=value
+	binary.BigEndian.PutUint32(buf[64:68], 0x00000002)
+	binary.BigEndian.PutUint32(buf[68:72], 0x00000020)
+	binary.BigEndian.PutUint32(buf[72:76], checksum)
+	// BlocksRunCount at [200:204]; chunk-run entries follow at [204:].
+	binary.BigEndian.PutUint32(buf[200:204], uint32(len(runs)))
 	for i, r := range runs {
 		o := blkxHeaderSize + i*40
 		binary.BigEndian.PutUint32(buf[o:o+4], r.blockType)

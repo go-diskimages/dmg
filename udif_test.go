@@ -414,8 +414,8 @@ func TestParseBlkxTable_TooSmallForRuns(t *testing.T) {
 	buf := make([]byte, blkxHeaderSize) // no runs appended
 	// set correct magic
 	binary.BigEndian.PutUint32(buf[0:4], blkxMagic)
-	// claim 100 runs
-	binary.BigEndian.PutUint32(buf[36:40], 100)
+	// claim 100 runs (BlocksRunCount lives at offset 200)
+	binary.BigEndian.PutUint32(buf[200:204], 100)
 	_, _, err := parseBlkxTable(buf)
 	if err == nil {
 		t.Fatal("expected error when buffer too small for declared runs")
