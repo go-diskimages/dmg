@@ -306,7 +306,15 @@ func TestWriteUDIF_Checksums(t *testing.T) {
 	if err := writeUDIF(path, sectors, udifVariantCodes["UDRW"]); err != nil {
 		t.Fatalf("writeUDIF: %v", err)
 	}
-	// Read back the koly block and verify checksums are non-zero.
+	// Read back the koly block. Its two checksum slots are deliberately
+	// EMPTY, and the blkx table carries the checksum instead.
+	//
+	// This test used to assert the opposite. Declaring type 2 in the koly
+	// made hdiutil validate a value it rejected -- measured on macOS 26,
+	// "invalid checksum", with everything else held constant -- so the image
+	// would not attach at all. An unverified image that mounts beats a
+	// verified-looking one that does not, and the blkx checksum this package
+	// writes IS correct, so integrity checking lost nothing.
 	f, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -321,11 +329,30 @@ func TestWriteUDIF_Checksums(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseKoly: %v", err)
 	}
-	if koly.dataForkChecksum == 0 {
-		t.Error("dataForkChecksum is zero")
+	if koly.dataForkChecksum != 0 {
+		t.Errorf("dataForkChecksum = 0x%08x, want 0 (type 0, no checksum)", koly.dataForkChecksum)
 	}
-	if koly.masterChecksum == 0 {
-		t.Error("masterChecksum is zero")
+	if koly.masterChecksum != 0 {
+		t.Errorf("masterChecksum = 0x%08x, want 0 (type 0, no checksum)", koly.masterChecksum)
+	}
+	// …and the blkx table does carry one.
+	plist := make([]byte, koly.xmlLength)
+	if _, err := f.ReadAt(plist, int64(koly.xmlOffset)); err != nil {
+		t.Fatalf("read plist: %v", err)
+	}
+	items, err := parsePlistBlkx(plist)
+	if err != nil {
+		t.Fatalf("parsePlistBlkx: %v", err)
+	}
+	if len(items) == 0 {
+		t.Fatal("no blkx items")
+	}
+	tbl, _, err := parseBlkxTable(items[0].Data)
+	if err != nil {
+		t.Fatalf("parseBlkxTable: %v", err)
+	}
+	if tbl.checksumType != blkxChecksumCRC32 || tbl.checksum == 0 {
+		t.Errorf("blkx checksum type=%d value=0x%08x, want CRC-32 and non-zero", tbl.checksumType, tbl.checksum)
 	}
 }
 
