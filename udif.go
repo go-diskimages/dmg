@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/go-compressions/lzfse"
 )
@@ -70,15 +71,32 @@ const (
 
 	blkxNocopy = uint32(0x00000000) // zero-fill, no stored data
 	blkxRaw    = uint32(0x00000001) // raw / uncompressed
+	blkxIgnore = uint32(0x00000002) // zero-fill, stored length may be non-zero
 	blkxFree   = uint32(0x7FFFFFFE) // unallocated
 	blkxLzfse  = uint32(0x80000004) // LZFSE compressed (Apple, macOS 10.12+)
 	blkxZlib   = uint32(0x80000005) // zlib compressed
 	blkxTerm   = uint32(0xFFFFFFFF) // terminator
+
+	blkxChecksumCRC32 = uint32(0x00000002)
 )
 
-var udifVariantNames = map[uint32]string{
-	1: "UDRW", 2: "UDRO", 3: "UDCO", 4: "UDZO", 5: "UDBZ", 11: "UDSP",
-}
+// imageVariant (koly +488) is a LAYOUT discriminator, not a format selector.
+// Measured on macOS 26 with everything else held constant:
+//
+//	imageVariant = 1, one whole-disk blkx  -> attach fails, "Bad file descriptor"
+//	imageVariant = 2, one whole-disk blkx  -> attaches
+//
+// 1 means the blkx array describes a PARTITION MAP; with 1 and no partition
+// entries hdiutil goes looking for partitions and dies. libdmg-hfsplus names
+// the two kUDIFPartitionImageType / kUDIFDeviceImageType, which reads backwards
+// from the observed behaviour -- trust the behaviour, not the names.
+//
+// The compression format is nowhere in the koly block: a reader infers it from
+// the chunk types in the blkx table, which is what DetectUDIFFormat now does.
+const (
+	imageVariantPartitioned = uint32(1)
+	imageVariantWholeDisk   = uint32(2)
+)
 
 var udifVariantCodes = map[string]uint32{
 	"UDRW": 1, "UDRO": 2, "UDCO": 3, "UDZO": 4, "UDBZ": 5, "UDSP": 11,
@@ -148,16 +166,23 @@ func kolyToBytes(k kolyBlock) [kolyBlockSize]byte {
 	binary.BigEndian.PutUint32(b[56:60], k.segmentNumber)
 	binary.BigEndian.PutUint32(b[60:64], k.segmentCount)
 	copy(b[64:80], k.segmentID[:])
-	// dataForkChecksum: [80:84]=type CRC-32, [84:88]=size 32, [88:92]=value
-	binary.BigEndian.PutUint32(b[80:84], 0x00000002)
-	binary.BigEndian.PutUint32(b[84:88], 0x00000020)
-	binary.BigEndian.PutUint32(b[88:92], k.dataForkChecksum)
+	// dataForkChecksum: [80:84]=type, [84:88]=size in bits, [88:92]=value.
+	// Type 0 means "no checksum", and a zero value must be written that way:
+	// declaring type 2 makes hdiutil validate the field, so an unset value
+	// there is not "unverified", it is "wrong" and the image will not attach.
+	if k.dataForkChecksum != 0 {
+		binary.BigEndian.PutUint32(b[80:84], 0x00000002)
+		binary.BigEndian.PutUint32(b[84:88], 0x00000020)
+		binary.BigEndian.PutUint32(b[88:92], k.dataForkChecksum)
+	}
 	binary.BigEndian.PutUint64(b[216:224], k.xmlOffset)
 	binary.BigEndian.PutUint64(b[224:232], k.xmlLength)
-	// masterChecksum: [352:356]=type CRC-32, [356:360]=size 32, [360:364]=value
-	binary.BigEndian.PutUint32(b[352:356], 0x00000002)
-	binary.BigEndian.PutUint32(b[356:360], 0x00000020)
-	binary.BigEndian.PutUint32(b[360:364], k.masterChecksum)
+	// masterChecksum: same encoding, same reason.
+	if k.masterChecksum != 0 {
+		binary.BigEndian.PutUint32(b[352:356], 0x00000002)
+		binary.BigEndian.PutUint32(b[356:360], 0x00000020)
+		binary.BigEndian.PutUint32(b[360:364], k.masterChecksum)
+	}
 	binary.BigEndian.PutUint32(b[488:492], k.imageVariant)
 	binary.BigEndian.PutUint64(b[492:500], k.sectorCount)
 	return b
@@ -169,6 +194,13 @@ type blkxTable struct {
 	sectorNumber uint64
 	sectorCount  uint64
 	dataOffset   uint64
+	// checksum is the blkx table's own CRC-32 of the UNCOMPRESSED sectors it
+	// describes (header +64 type, +68 size, +72 value). This is the checksum
+	// this package can compute correctly, and the one qemu-img validates, so
+	// it is what integrity checking hangs off -- not the koly block, whose
+	// value hdiutil rejects (see kolyToBytes).
+	checksumType uint32
+	checksum     uint32
 }
 
 type blkxRun struct {
@@ -191,6 +223,8 @@ func parseBlkxTable(b []byte) (blkxTable, []blkxRun, error) {
 		return blkxTable{}, nil, fmt.Errorf("blkx: buffer too small for %d runs", n)
 	}
 	t := blkxTable{
+		checksumType: binary.BigEndian.Uint32(b[64:68]),
+		checksum:     binary.BigEndian.Uint32(b[72:76]),
 		sectorNumber: binary.BigEndian.Uint64(b[8:16]),
 		sectorCount:  binary.BigEndian.Uint64(b[16:24]),
 		dataOffset:   binary.BigEndian.Uint64(b[24:32]),
@@ -242,8 +276,11 @@ func writeBlkxTable(t blkxTable, runs []blkxRun, checksum uint32) []byte {
 func decompressRun(f io.ReaderAt, dataOffset uint64, r blkxRun) ([]byte, error) {
 	out := make([]byte, r.sectorCount*udifSectorSize)
 	switch r.blockType {
-	case blkxNocopy, blkxFree:
-		// zero-initialised already
+	case blkxNocopy, blkxIgnore, blkxFree:
+		// Zero-fill. blkxIgnore (0x00000002) was missing, and hdiutil emits it
+		// in every UDZO it writes, so reading ANY Apple-produced compressed
+		// image failed with "unsupported block type 0x00000002". Nothing in
+		// the package's own output uses it, which is why no test saw it.
 	case blkxRaw:
 		if _, err := f.ReadAt(out, int64(dataOffset+r.compressedOffset)); err != nil {
 			return nil, fmt.Errorf("blkx raw read: %w", err)
@@ -481,7 +518,16 @@ func parseBlkxDictEntry(dec *xml.Decoder) (blkxPlistItem, error) {
 				if err := dec.DecodeElement(&v, &t); err != nil {
 					return item, err
 				}
-				clean := strings.ReplaceAll(strings.ReplaceAll(v, "\n", ""), " ", "")
+				// Strip ALL whitespace, not just newlines and spaces:
+				// hdiutil indents its <data> with TABS, so a genuine Apple
+				// image failed here at input byte 0 while every image this
+				// package wrote itself decoded fine.
+				clean := strings.Map(func(r rune) rune {
+					if unicode.IsSpace(r) {
+						return -1
+					}
+					return r
+				}, v)
 				decoded, err := base64.StdEncoding.DecodeString(clean)
 				if err != nil {
 					return item, fmt.Errorf("udif: base64 decode blkx Data: %w", err)
@@ -564,14 +610,31 @@ func readAllUDIFSectors(path string) ([]byte, kolyBlock, error) {
 		if err := fillSectorsFromRuns(f, tbl, runs, sectors); err != nil {
 			return nil, kolyBlock{}, err
 		}
-	}
-	// Verify master checksum if present.
-	if koly.masterChecksum != 0 {
-		got := crc32.ChecksumIEEE(sectors)
-		if got != koly.masterChecksum {
-			return nil, kolyBlock{}, fmt.Errorf("udif: master checksum mismatch (want 0x%08x, got 0x%08x)", koly.masterChecksum, got)
+		// Integrity is checked only on images THIS package wrote, and the
+		// discriminator is honest rather than clever: our writer leaves the
+		// koly checksum slots empty (type 0), hdiutil always fills them.
+		//
+		// The reason for the restriction is measured. Apple's CRC-32 over the
+		// same sectors is not crc32.ChecksumIEEE of the sector bytes -- a
+		// genuine hdiutil UDZO declares 0x53eff58f where we compute
+		// 0xe823f5b4 -- so enforcing our definition on a foreign image would
+		// condemn a perfectly good DMG as corrupt. Until Apple's variant is
+		// worked out, the only checksums this package is entitled to judge
+		// are its own.
+		if koly.masterChecksum == 0 && koly.dataForkChecksum == 0 &&
+			tbl.checksumType == blkxChecksumCRC32 && tbl.checksum != 0 {
+			lo := tbl.sectorNumber * udifSectorSize
+			hi := lo + tbl.sectorCount*udifSectorSize
+			if hi > uint64(len(sectors)) {
+				hi = uint64(len(sectors))
+			}
+			if got := crc32.ChecksumIEEE(sectors[lo:hi]); got != tbl.checksum {
+				return nil, kolyBlock{}, fmt.Errorf("udif: blkx checksum mismatch (want 0x%08x, got 0x%08x)", tbl.checksum, got)
+			}
 		}
 	}
+	// The koly checksum slots are never verified: same reason as above, and
+	// this package no longer writes them at all.
 	return sectors, koly, nil
 }
 
@@ -605,10 +668,23 @@ func writeUDIF(path string, sectors []byte, variant uint32) error {
 	default: // UDRW, UDRO, …
 		runs, dataFork = buildRunsForRaw(sectors)
 	}
-	// Checksums: CRC-32 of uncompressed sectors (master + blkx),
-	// and CRC-32 of the compressed data fork bytes.
+	// Checksums.
+	//
+	// The blkx table carries a CRC-32 of the uncompressed sectors, which is
+	// what a reader uses and what qemu-img checks. The two KOLY checksum
+	// blocks are a different matter: declaring type 2 / 32 bits there makes
+	// hdiutil VALIDATE them, and the value written here was rejected --
+	// measured on macOS 26, one variable at a time:
+	//
+	//	imageVariant 2 + koly checksums type 2 -> "invalid checksum"
+	//	imageVariant 2 + koly checksums type 0 -> attaches, mounts, reads
+	//
+	// So the koly blocks are left as type 0 ("no checksum"), which is a
+	// legitimate UDIF encoding, rather than carrying a value that is wrong.
+	// Writing a CORRECT koly checksum is worth doing; claiming one we cannot
+	// compute is not, and an image that will not mount is a worse outcome
+	// than one that is merely unverified.
 	sectorsCRC := crc32.ChecksumIEEE(sectors)
-	dataForkCRC := crc32.ChecksumIEEE(dataFork)
 	tblBytes := writeBlkxTable(blkxTable{sectorNumber: 0, sectorCount: n, dataOffset: 0}, runs, sectorsCRC)
 	plistBytes := writePlistBlkx([]blkxPlistItem{
 		{Attributes: "0x0050", Data: tblBytes, ID: "0", Name: "whole disk (UDIF)"},
@@ -618,9 +694,10 @@ func writeUDIF(path string, sectors []byte, variant uint32) error {
 		flags: 1, runningDataForkOffset: xmlOff, dataForkOffset: 0,
 		dataForkLength: xmlOff, segmentNumber: 1, segmentCount: 1,
 		xmlOffset: xmlOff, xmlLength: uint64(len(plistBytes)),
-		imageVariant: variant, sectorCount: n,
-		dataForkChecksum: dataForkCRC,
-		masterChecksum:   sectorsCRC,
+		imageVariant: imageVariantWholeDisk, sectorCount: n,
+		// left zero on purpose: see the note above
+		dataForkChecksum: 0,
+		masterChecksum:   0,
 	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -664,11 +741,49 @@ func DetectUDIFFormat(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("DetectUDIFFormat: %w", err)
 	}
-	name, ok := udifVariantNames[koly.imageVariant]
-	if !ok {
-		return "", fmt.Errorf("DetectUDIFFormat: unknown image variant %d", koly.imageVariant)
+	// The format is NOT in the koly block. imageVariant is a layout
+	// discriminator (see the constants above); reading it as a format name
+	// returned "UDRW" for a genuine Apple UDZO, which is how this went
+	// unnoticed. Infer the format from the chunk types actually present.
+	xml := make([]byte, koly.xmlLength)
+	if _, err := osReadAtFile(f, xml, int64(koly.xmlOffset)); err != nil {
+		return "", fmt.Errorf("DetectUDIFFormat: read plist: %w", err)
 	}
-	return name, nil
+	items, err := parsePlistBlkx(xml)
+	if err != nil {
+		return "", fmt.Errorf("DetectUDIFFormat: %w", err)
+	}
+	seen := map[uint32]bool{}
+	for _, it := range items {
+		_, runs, err := parseBlkxTable(it.Data)
+		if err != nil {
+			return "", fmt.Errorf("DetectUDIFFormat: %w", err)
+		}
+		for _, r := range runs {
+			seen[r.blockType] = true
+		}
+	}
+	switch {
+	case seen[blkxZlib]:
+		return "UDZO", nil
+	case seen[blkxLzfse]:
+		return "ULFO", nil
+	case seen[blkxNocopy]:
+		// A zero-fill run means zero sectors were ELIDED rather than stored,
+		// which is the whole of what UDSP is. buildRunsForRaw never emits one
+		// (it writes a single raw run covering every sector), so a NOCOPY run
+		// distinguishes the two for images this package wrote.
+		//
+		// It is a weaker signal for foreign images: UDSP is a layout choice,
+		// not a chunk encoding, so a sparse image whose sectors happen to be
+		// all non-zero is genuinely indistinguishable from UDRW. The format is
+		// simply not recorded in a UDIF file; anything here is inference.
+		return "UDSP", nil
+	case koly.imageVariant == imageVariantPartitioned:
+		return "UDRO", nil
+	default:
+		return "UDRW", nil
+	}
 }
 
 // ConvertUDIF reads all sectors from src and writes them to dst in dstFormat.
