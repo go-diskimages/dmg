@@ -806,6 +806,20 @@ func DetectUDIFFormat(path string) (string, error) {
 	case koly.imageVariant == imageVariantPartitioned:
 		return "UDRO", nil
 	default:
+		// "UDRW" here means an uncompressed UDIF image whose sectors THIS
+		// PACKAGE can rewrite in place, which is what dmg_block_device asks
+		// for. It is NOT what hdiutil means by UDRW, and the difference is
+		// not cosmetic:
+		//
+		//	hdiutil create -format UDRW  -> the raw volume, NO koly trailer,
+		//	                                a file exactly the volume's size,
+		//	                                "Format Description: raw read/write"
+		//	an image written here        -> koly + blkx; hdiutil imageinfo
+		//	                                calls it UDRO and macOS mounts it
+		//	                                READ-ONLY, whatever imageVariant says
+		//
+		// So an image this package calls UDRW cannot be given to a user as a
+		// writable disk image. See the note on WrapRaw.
 		return "UDRW", nil
 	}
 }
@@ -864,8 +878,9 @@ func UnpackToTemp(path string) (string, error) {
 	return tmpPath, nil
 }
 
-// PackFromTemp creates a UDIF UDRW image at destPath containing the raw
-// sectors from tmpPath. It atomically replaces destPath.
+// PackFromTemp creates a UDIF image at destPath containing the raw sectors
+// from tmpPath, atomically replacing destPath. Like WrapRaw, what it writes
+// is read-only to macOS however DetectUDIFFormat names it.
 func PackFromTemp(tmpPath, destPath string) error {
 	f, err := os.Open(tmpPath)
 	if err != nil {
@@ -900,7 +915,14 @@ func PackFromTemp(tmpPath, destPath string) error {
 	return nil
 }
 
-// WrapRaw converts the raw file at path to a UDIF UDRW image in-place.
+// WrapRaw wraps the raw file at path in a UDIF container, in place.
+//
+// macOS mounts the result READ-ONLY and hdiutil imageinfo calls it UDRO: a
+// UDIF container is read-only whatever its imageVariant says, and a writable
+// image is the raw file with no container at all. DetectUDIFFormat reports
+// "UDRW" for what this writes because the sectors can be rewritten in place
+// by this package -- see the note there. Do not ship the result as a
+// read/write image.
 func WrapRaw(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
