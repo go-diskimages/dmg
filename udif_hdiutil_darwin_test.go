@@ -72,3 +72,51 @@ func TestHdiutilAttachesWhatWeWrite(t *testing.T) {
 		t.Errorf("attached but did not mount:\n%s", out)
 	}
 }
+
+// The compressed path, which is what a real .dmg uses and which stayed broken
+// after the raw one was fixed: BuffersNeeded was left at zero, and a raw run
+// needs no decompression buffer, so only UDZO ever felt it.
+func TestHdiutilAttachesOurUDZO(t *testing.T) {
+	hdiutil, err := exec.LookPath("hdiutil")
+	if err != nil {
+		t.Skip("hdiutil not present")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.dmg")
+	mk := exec.Command(hdiutil, "create", "-size", "8m", "-fs", "HFS+",
+		"-volname", "UDZOProbe", "-layout", "NONE", "-ov", src)
+	if out, err := mk.CombinedOutput(); err != nil {
+		t.Skipf("hdiutil create unavailable here: %v\n%s", err, out)
+	}
+	raw := filepath.Join(dir, "raw.dmg")
+	b, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(raw, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := WrapRaw(raw); err != nil {
+		t.Fatalf("WrapRaw: %v", err)
+	}
+	zo := filepath.Join(dir, "zo.dmg")
+	if err := ConvertUDIF(raw, zo, "UDZO"); err != nil {
+		t.Fatalf("ConvertUDIF: %v", err)
+	}
+	out, err := exec.Command(hdiutil, "attach", "-nobrowse", "-readonly", zo).CombinedOutput()
+	if err != nil {
+		t.Fatalf("hdiutil refused a UDZO this package wrote: %v\n%s", err, out)
+	}
+	dev := devRe.FindString(string(out))
+	if dev == "" {
+		t.Fatalf("attached but no device in output:\n%s", out)
+	}
+	t.Cleanup(func() {
+		if o, err := exec.Command(hdiutil, "detach", dev).CombinedOutput(); err != nil {
+			t.Errorf("detach %s: %v\n%s", dev, err, o)
+		}
+	})
+	if !strings.Contains(string(out), "/Volumes/") {
+		t.Errorf("attached but did not mount:\n%s", out)
+	}
+}

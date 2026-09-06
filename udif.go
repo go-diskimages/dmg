@@ -252,6 +252,30 @@ func writeBlkxTable(t blkxTable, runs []blkxRun, checksum uint32) []byte {
 	binary.BigEndian.PutUint64(buf[8:16], t.sectorNumber)
 	binary.BigEndian.PutUint64(buf[16:24], t.sectorCount)
 	binary.BigEndian.PutUint64(buf[24:32], t.dataOffset)
+	// BuffersNeeded at [32:36] is how many 512-byte sectors a reader must be
+	// able to hold to decompress the largest run. Leaving it ZERO is what made
+	// every compressed image this package wrote fail to attach with "corrupt
+	// image" -- measured on macOS 26, sweeping only this field on an otherwise
+	// untouched UDZO whose largest run is 2048 sectors:
+	//
+	//	1 -> corrupt image     2047 -> corrupt image
+	//	8 -> corrupt image     2048 -> ATTACHES        2056 -> ATTACHES
+	//
+	// A sharp boundary at the largest run, so the value is derived from the
+	// runs rather than hardcoded. The +8 matches what hdiutil writes (2056 for
+	// 2048-sector chunks) and costs a reader nothing.
+	//
+	// The raw path survived this because a raw run needs no decompression
+	// buffer at all, which is why the defect only ever showed on UDZO.
+	var largest uint64
+	for _, r := range runs {
+		if r.blockType != blkxTerm && r.sectorCount > largest {
+			largest = r.sectorCount
+		}
+	}
+	if largest > 0 {
+		binary.BigEndian.PutUint32(buf[32:36], uint32(largest)+8)
+	}
 	// UDIFChecksum at [64:200]: type[64:68]=CRC-32, size[68:72]=32 bits, data[72:76]=value
 	binary.BigEndian.PutUint32(buf[64:68], 0x00000002)
 	binary.BigEndian.PutUint32(buf[68:72], 0x00000020)
