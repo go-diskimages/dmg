@@ -9,29 +9,55 @@ import (
 // file. It is what `hdiutil create -format UDRW` writes -- hdiutil imageinfo
 // reports "raw read/write" for one -- and the only shape macOS will mount
 // read/write. Everything else in this package is about the UDIF container,
-// which is read-only however its trailer is stamped.
+// which the system mounts read-only however its trailer is stamped.
 
-// hasKolyTrailer reports whether path ends in a koly block, which is what
-// makes a file a UDIF image rather than a raw one.
-func hasKolyTrailer(path string) (bool, error) {
+// osReadWholeFile is a seam, like the ones in udif.go: it is what makes the
+// unreadable-file branch reachable without a test that depends on not being
+// root.
+var osReadWholeFile = os.ReadFile
+
+// classify opens path and reports whether it is a UDIF image, handing back
+// its koly trailer when it is. A raw image gets a zero koly and no error.
+//
+// Every reader below goes through here so the "could not open / stat / read
+// the trailer" cases are answered once, in one place, rather than four times
+// with four slightly different messages.
+func classify(path string) (*os.File, kolyBlock, bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return false, err
+		return nil, kolyBlock{}, false, err
 	}
-	defer f.Close()
 	info, err := osStatFile(f)
 	if err != nil {
-		return false, err
+		f.Close()
+		return nil, kolyBlock{}, false, err
 	}
 	if info.Size() < kolyBlockSize {
-		return false, nil
+		return f, kolyBlock{}, false, nil
 	}
 	buf := make([]byte, kolyBlockSize)
 	if _, err := osReadAtFile(f, buf, info.Size()-kolyBlockSize); err != nil {
+		f.Close()
+		return nil, kolyBlock{}, false, err
+	}
+	koly, err := parseKoly(buf)
+	if err != nil {
+		// Not a koly trailer, so the file is raw -- which is a shape, not a
+		// failure.
+		return f, kolyBlock{}, false, nil
+	}
+	return f, koly, true, nil
+}
+
+// isUDIFImage reports whether path ends in a koly block, which is what makes
+// a file a UDIF image rather than a raw one.
+func isUDIFImage(path string) (bool, error) {
+	f, _, udif, err := classify(path)
+	if err != nil {
 		return false, err
 	}
-	_, err = parseKoly(buf)
-	return err == nil, nil
+	f.Close()
+	return udif, nil
 }
 
 // readSectors returns every sector of the image at path, whether it is a UDIF
@@ -39,7 +65,7 @@ func hasKolyTrailer(path string) (bool, error) {
 // that is neither is refused rather than padded, because padding a file that
 // is not an image produces an image.
 func readSectors(path string) ([]byte, error) {
-	udif, err := hasKolyTrailer(path)
+	udif, err := isUDIFImage(path)
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +73,7 @@ func readSectors(path string) ([]byte, error) {
 		sectors, _, err := readAllUDIFSectors(path)
 		return sectors, err
 	}
-	b, err := os.ReadFile(path)
+	b, err := osReadWholeFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -69,33 +95,17 @@ func readSectors(path string) ([]byte, error) {
 // It is NOT a claim about macOS: a UDIF image is mounted read-only by the
 // system whatever this answers. It is a claim about the bytes.
 func InPlaceWritable(path string) (bool, error) {
-	udif, err := hasKolyTrailer(path)
-	if err != nil {
-		return false, err
-	}
-	if !udif {
-		info, err := os.Stat(path)
-		if err != nil {
-			return false, err
-		}
-		return info.Size() > 0 && info.Size()%udifSectorSize == 0, nil
-	}
-	f, err := os.Open(path)
+	f, koly, udif, err := classify(path)
 	if err != nil {
 		return false, err
 	}
 	defer f.Close()
-	info, err := osStatFile(f)
-	if err != nil {
-		return false, err
-	}
-	buf := make([]byte, kolyBlockSize)
-	if _, err := osReadAtFile(f, buf, info.Size()-kolyBlockSize); err != nil {
-		return false, err
-	}
-	koly, err := parseKoly(buf)
-	if err != nil {
-		return false, err
+	if !udif {
+		info, err := osStatFile(f)
+		if err != nil {
+			return false, err
+		}
+		return info.Size() > 0 && info.Size()%udifSectorSize == 0, nil
 	}
 	xml := make([]byte, koly.xmlLength)
 	if _, err := osReadAtFile(f, xml, int64(koly.xmlOffset)); err != nil {
@@ -129,7 +139,7 @@ func InPlaceWritable(path string) (bool, error) {
 // the koly's imageVariant to a switch comparing it against FORMAT codes, so it
 // never matched, and growing a UDZO image rewrote it uncompressed.
 func writeSectors(path string, sectors []byte) error {
-	udif, err := hasKolyTrailer(path)
+	udif, err := isUDIFImage(path)
 	if err != nil {
 		return err
 	}

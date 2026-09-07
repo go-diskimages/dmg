@@ -865,10 +865,13 @@ func ConvertUDIF(src, dst, dstFormat string) error {
 	return nil
 }
 
-// IsUDIF returns true if path contains an Apple UDIF image (valid koly trailer).
+// IsUDIF returns true if path contains an Apple UDIF image, which is to say a
+// valid koly trailer. It asks about the CONTAINER, not about what is in it: an
+// image whose plist is unreadable is still a UDIF image, and answering "no"
+// for it would route it to whatever handles raw files.
 func IsUDIF(path string) bool {
-	_, err := DetectUDIFFormat(path)
-	return err == nil
+	udif, err := isUDIFImage(path)
+	return err == nil && udif
 }
 
 // UnpackToTemp extracts all sectors from the UDIF image at path into a
