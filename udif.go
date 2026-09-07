@@ -98,8 +98,25 @@ const (
 	imageVariantWholeDisk   = uint32(2)
 )
 
-var udifVariantCodes = map[string]uint32{
-	"UDRW": 1, "UDRO": 2, "UDCO": 3, "UDZO": 4, "UDBZ": 5, "UDSP": 11,
+// A runEncoding says how the writer stores the sectors. It never reaches the
+// file: the format is not recorded in a UDIF image at all (see
+// DetectUDIFFormat), and imageVariant is a layout discriminator. These two
+// ideas used to be one map from format names to "variant codes", which is how
+// an image macOS mounts read-only came to be called UDRW.
+type runEncoding int
+
+const (
+	encRaw runEncoding = iota
+	encZlib
+	encSparse
+)
+
+// containerFormats are the UDIF format names ConvertUDIF accepts as a
+// destination, with the encoding each one asks for. "UDRW" is deliberately
+// absent: it is not a UDIF format but the raw image, written with no
+// container at all, which is what hdiutil writes for it.
+var containerFormats = map[string]runEncoding{
+	"UDRO": encRaw, "UDZO": encZlib, "UDSP": encSparse,
 }
 
 // ─── koly block ───────────────────────────────────────────────────────────────
@@ -678,18 +695,18 @@ func fillSectorsFromRuns(f io.ReaderAt, tbl blkxTable, runs []blkxRun, sectors [
 	return nil
 }
 
-// writeUDIF creates a UDIF image at path containing the provided sector data.
-// variant selects the image type (use udifVariantCodes["UDRW"] etc.).
-func writeUDIF(path string, sectors []byte, variant uint32) error {
+// writeUDIF creates a UDIF image at path containing the provided sector data,
+// with the sectors stored as enc says.
+func writeUDIF(path string, sectors []byte, enc runEncoding) error {
 	n := uint64(len(sectors) / udifSectorSize)
 	var runs []blkxRun
 	var dataFork []byte
-	switch variant {
-	case udifVariantCodes["UDSP"]:
+	switch enc {
+	case encSparse:
 		runs, dataFork = buildRunsForSparse(sectors)
-	case udifVariantCodes["UDZO"]:
+	case encZlib:
 		runs, dataFork = buildRunsForZlib(sectors)
-	default: // UDRW, UDRO, …
+	default:
 		runs, dataFork = buildRunsForRaw(sectors)
 	}
 	// Checksums.
@@ -803,24 +820,13 @@ func DetectUDIFFormat(path string) (string, error) {
 		// all non-zero is genuinely indistinguishable from UDRW. The format is
 		// simply not recorded in a UDIF file; anything here is inference.
 		return "UDSP", nil
-	case koly.imageVariant == imageVariantPartitioned:
-		return "UDRO", nil
 	default:
-		// "UDRW" here means an uncompressed UDIF image whose sectors THIS
-		// PACKAGE can rewrite in place, which is what dmg_block_device asks
-		// for. It is NOT what hdiutil means by UDRW, and the difference is
-		// not cosmetic:
-		//
-		//	hdiutil create -format UDRW  -> the raw volume, NO koly trailer,
-		//	                                a file exactly the volume's size,
-		//	                                "Format Description: raw read/write"
-		//	an image written here        -> koly + blkx; hdiutil imageinfo
-		//	                                calls it UDRO and macOS mounts it
-		//	                                READ-ONLY, whatever imageVariant says
-		//
-		// So an image this package calls UDRW cannot be given to a user as a
-		// writable disk image. See the note on WrapRaw.
-		return "UDRW", nil
+		// Uncompressed, in a container: read-only. No UDIF image is UDRW,
+		// whatever its imageVariant is stamped with -- macOS mounts every one
+		// of them read-only, and hdiutil imageinfo calls them UDRO. UDRW is
+		// the raw image, which has no koly trailer for this function to read;
+		// InPlaceWritable is the question a caller usually means to ask.
+		return "UDRO", nil
 	}
 }
 
@@ -830,19 +836,30 @@ func DetectUDIFFormat(path string) (string, error) {
 // For UDSP, zero sectors are stored as NOCOPY (no data) runs.
 // For UDZO, sectors are compressed with zlib.
 func ConvertUDIF(src, dst, dstFormat string) error {
-	code, ok := udifVariantCodes[dstFormat]
-	if !ok {
+	enc, ok := containerFormats[dstFormat]
+	switch {
+	case dstFormat == "UDRW":
+		// Not a UDIF format: the raw image, with no container. hdiutil
+		// writes one for -format UDRW and reports "raw read/write" for it,
+		// and an image WITH a container is mounted read-only whatever its
+		// trailer says.
+	case ok:
+	case dstFormat == "UDCO" || dstFormat == "UDBZ":
+		return fmt.Errorf("ConvertUDIF: compression format %q is not yet supported for writing", dstFormat)
+	default:
 		return fmt.Errorf("ConvertUDIF: unknown format %q", dstFormat)
 	}
-	switch dstFormat {
-	case "UDCO", "UDBZ":
-		return fmt.Errorf("ConvertUDIF: compression format %q is not yet supported for writing", dstFormat)
-	}
-	sectors, _, err := readAllUDIFSectors(src)
+	sectors, err := readSectors(src)
 	if err != nil {
 		return fmt.Errorf("ConvertUDIF read src: %w", err)
 	}
-	if err := writeUDIF(dst, sectors, code); err != nil {
+	if dstFormat == "UDRW" {
+		if err := os.WriteFile(dst, sectors, 0o600); err != nil {
+			return fmt.Errorf("ConvertUDIF write dst: %w", err)
+		}
+		return nil
+	}
+	if err := writeUDIF(dst, sectors, enc); err != nil {
 		return fmt.Errorf("ConvertUDIF write dst: %w", err)
 	}
 	return nil
@@ -904,7 +921,7 @@ func PackFromTemp(tmpPath, destPath string) error {
 	}
 	tmpName := tmp2.Name()
 	tmp2.Close()
-	if err := writeUDIF(tmpName, sectors, udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(tmpName, sectors, encRaw); err != nil {
 		os.Remove(tmpName)
 		return fmt.Errorf("udif: PackFromTemp: write udif: %w", err)
 	}
@@ -940,16 +957,17 @@ func WrapRaw(path string) error {
 		return fmt.Errorf("udif: WrapRaw: read: %w", err)
 	}
 	f.Close()
-	return writeUDIF(path, sectors, udifVariantCodes["UDRW"])
+	return writeUDIF(path, sectors, encRaw)
 }
 
-// ResizeUDRW grows the UDIF image at path to newSizeBytes (rounded up to sector
-// boundary). Shrinking is not supported. The image variant is preserved.
+// ResizeUDRW grows the image at path to newSizeBytes (rounded up to a sector
+// boundary), raw or UDIF, and puts it back in the shape it was found in.
+// Shrinking is not supported.
 func ResizeUDRW(path string, newSizeBytes int64) error {
 	if newSizeBytes <= 0 {
 		return fmt.Errorf("ResizeUDRW: size must be positive, got %d", newSizeBytes)
 	}
-	sectors, koly, err := readAllUDIFSectors(path)
+	sectors, err := readSectors(path)
 	if err != nil {
 		return fmt.Errorf("ResizeUDRW read: %w", err)
 	}
@@ -963,5 +981,5 @@ func ResizeUDRW(path string, newSizeBytes int64) error {
 	}
 	grown := make([]byte, newSectorCount*udifSectorSize)
 	copy(grown, sectors)
-	return writeUDIF(path, grown, koly.imageVariant)
+	return writeSectors(path, grown)
 }

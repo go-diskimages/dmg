@@ -62,21 +62,28 @@ func TestDecompressRunIgnoreIsZeroFill(t *testing.T) {
 // anywhere in a UDIF file.
 func TestDetectUDIFFormatInfersFromChunks(t *testing.T) {
 	dir := t.TempDir()
-	for _, tc := range []struct{ format, want string }{
-		{"UDRW", "UDRW"},
-		{"UDZO", "UDZO"},
-		{"UDSP", "UDSP"},
+	for _, tc := range []struct {
+		name string
+		enc  runEncoding
+		want string
+	}{
+		// Uncompressed and in a container is UDRO, not UDRW: no UDIF image
+		// is UDRW. That name belongs to the raw image, which has no
+		// container for this function to read.
+		{"raw runs", encRaw, "UDRO"},
+		{"zlib runs", encZlib, "UDZO"},
+		{"elided zero runs", encSparse, "UDSP"},
 	} {
-		p := filepath.Join(dir, tc.format+".dmg")
-		if err := writeUDIF(p, makeTestSectors(64), udifVariantCodes[tc.format]); err != nil {
-			t.Fatalf("writeUDIF %s: %v", tc.format, err)
+		p := filepath.Join(dir, tc.name+".dmg")
+		if err := writeUDIF(p, makeTestSectors(64), tc.enc); err != nil {
+			t.Fatalf("writeUDIF %s: %v", tc.name, err)
 		}
 		got, err := DetectUDIFFormat(p)
 		if err != nil {
-			t.Fatalf("DetectUDIFFormat %s: %v", tc.format, err)
+			t.Fatalf("DetectUDIFFormat %s: %v", tc.name, err)
 		}
 		if got != tc.want {
-			t.Errorf("DetectUDIFFormat(%s) = %q, want %q", tc.format, got, tc.want)
+			t.Errorf("DetectUDIFFormat(%s) = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }
@@ -85,7 +92,7 @@ func TestDetectUDIFFormatInfersFromChunks(t *testing.T) {
 func TestDetectUDIFFormatPartitionedIsUDRO(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "ro.dmg")
-	if err := writeUDIF(p, makeTestSectors(8), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(p, makeTestSectors(8), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := os.ReadFile(p)
@@ -108,7 +115,7 @@ func TestDetectUDIFFormatPartitionedIsUDRO(t *testing.T) {
 func TestDetectUDIFFormatRejectsBrokenPlist(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "bad.dmg")
-	if err := writeUDIF(p, makeTestSectors(8), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(p, makeTestSectors(8), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := os.ReadFile(p)
@@ -128,7 +135,7 @@ func TestDetectUDIFFormatRejectsBrokenPlist(t *testing.T) {
 	// …and when the plist cannot even be READ, because the koly points past
 	// the end of the file.
 	q := filepath.Join(dir, "short.dmg")
-	if err := writeUDIF(q, makeTestSectors(8), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(q, makeTestSectors(8), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	raw2, err := os.ReadFile(q)
@@ -193,7 +200,7 @@ func TestBlkxChecksumClampsToImage(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "over.dmg")
 	sectors := makeTestSectors(8)
-	if err := writeUDIF(p, sectors, udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(p, sectors, encRaw); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := os.ReadFile(p)

@@ -87,12 +87,15 @@ func TestQemuImgInterop(t *testing.T) {
 	sectors := make([]byte, rawSize)
 	copy(sectors, raw)
 
-	for _, variant := range []string{"UDRW", "UDZO", "UDSP"} {
-		variant := variant
+	for _, tc := range []struct {
+		name string
+		enc  runEncoding
+	}{{"raw runs", encRaw}, {"zlib runs", encZlib}, {"elided zero runs", encSparse}} {
+		variant := tc.name
 		t.Run(variant, func(t *testing.T) {
 			dir := t.TempDir()
 			dmgPath := filepath.Join(dir, "image.dmg")
-			if err := writeUDIF(dmgPath, sectors, udifVariantCodes[variant]); err != nil {
+			if err := writeUDIF(dmgPath, sectors, tc.enc); err != nil {
 				t.Fatalf("writeUDIF(%s): %v", variant, err)
 			}
 

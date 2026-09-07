@@ -23,7 +23,7 @@ func (Format) Create(path string, sizeBytes int64) error {
 	}
 	sectorCount := (sizeBytes + udifSectorSize - 1) / udifSectorSize
 	sectors := make([]byte, sectorCount*udifSectorSize)
-	return writeUDIF(path, sectors, udifVariantCodes["UDRW"])
+	return writeUDIF(path, sectors, encRaw)
 }
 
 // Detect returns (true, nil) if path is an Apple UDIF image.
@@ -54,19 +54,19 @@ func (Format) ToRaw(src, dst string, _ io.Writer) error {
 	return dmgCopyFile(tmp, dst)
 }
 
-// Resize changes the virtual size of the UDIF image at path to newSizeBytes
-// (rounded up to sector boundary). Both grow and shrink are supported.
-// The image variant is preserved.
+// Resize changes the virtual size of the image at path to newSizeBytes
+// (rounded up to a sector boundary), raw or UDIF. Both grow and shrink are
+// supported, and the image is put back in the shape it was found in.
 func (Format) Resize(path string, newSizeBytes int64) error {
 	if newSizeBytes <= 0 {
 		return fmt.Errorf("dmg: Resize: size must be positive, got %d", newSizeBytes)
 	}
-	sectors, koly, err := readAllUDIFSectors(path)
+	sectors, err := readSectors(path)
 	if err != nil {
 		return fmt.Errorf("dmg: Resize: %w", err)
 	}
 	newSectorCount := (newSizeBytes + udifSectorSize - 1) / udifSectorSize
-	current := int64(koly.sectorCount)
+	current := int64(len(sectors)) / udifSectorSize
 	if newSectorCount == current {
 		return nil
 	}
@@ -77,7 +77,7 @@ func (Format) Resize(path string, newSizeBytes int64) error {
 	} else {
 		newSectors = sectors[:newSectorCount*udifSectorSize]
 	}
-	return writeUDIF(path, newSectors, koly.imageVariant)
+	return writeSectors(path, newSectors)
 }
 
 // dmgCopyFile copies src to dst as a plain byte copy.

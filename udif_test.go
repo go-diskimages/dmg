@@ -25,19 +25,22 @@ func makeTestSectors(n int) []byte {
 	return data
 }
 
-func TestDetectUDIFFormat_UDRW(t *testing.T) {
+func TestDetectUDIFFormat_UncompressedIsUDRO(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.dmg")
 	const nSectors = 2048 // 1 MiB
-	if err := writeUDIF(path, makeTestSectors(nSectors), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, makeTestSectors(nSectors), encRaw); err != nil {
 		t.Fatalf("writeUDIF: %v", err)
 	}
 	got, err := DetectUDIFFormat(path)
 	if err != nil {
 		t.Fatalf("DetectUDIFFormat: %v", err)
 	}
-	if got != "UDRW" {
-		t.Fatalf("expected UDRW, got %q", got)
+	// Uncompressed, but in a container: read-only. macOS mounts every UDIF
+	// image read-only whatever its trailer says, and hdiutil calls this one
+	// UDRO. UDRW is the raw image, which has no container at all.
+	if got != "UDRO" {
+		t.Fatalf("expected UDRO, got %q", got)
 	}
 }
 
@@ -56,7 +59,7 @@ func TestConvertUDIF_UDRW_to_UDSP_and_back(t *testing.T) {
 	dir := t.TempDir()
 	original := makeTestSectors(2048) // 1 MiB
 	srcPath := filepath.Join(dir, "src.udif")
-	if err := writeUDIF(srcPath, original, udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(srcPath, original, encRaw); err != nil {
 		t.Fatalf("writeUDIF: %v", err)
 	}
 
@@ -77,19 +80,23 @@ func TestConvertUDIF_UDRW_to_UDSP_and_back(t *testing.T) {
 			sparseInfo.Size(), srcInfo.Size())
 	}
 
-	// UDSP → UDRW round-trip
+	// UDSP → UDRW round-trip. UDRW is the raw image, so the result carries
+	// no trailer at all and is exactly the sectors.
 	dstPath := filepath.Join(dir, "dst.udif")
 	if err := ConvertUDIF(sparsePath, dstPath, "UDRW"); err != nil {
 		t.Fatalf("ConvertUDIF UDSP→UDRW: %v", err)
 	}
-	if fmt, _ := DetectUDIFFormat(dstPath); fmt != "UDRW" {
-		t.Fatalf("expected UDRW after round-trip, got %q", fmt)
+	if IsUDIF(dstPath) {
+		t.Fatal("a UDRW conversion wrote a UDIF container; macOS would mount it read-only")
+	}
+	if info, err := os.Stat(dstPath); err != nil || info.Size() != int64(len(original)) {
+		t.Fatalf("raw image is %v bytes (%v), want %d", info.Size(), err, len(original))
 	}
 
 	// Sector data must survive the round-trip.
-	recovered, _, err := readAllUDIFSectors(dstPath)
+	recovered, err := readSectors(dstPath)
 	if err != nil {
-		t.Fatalf("readAllUDIFSectors: %v", err)
+		t.Fatalf("readSectors: %v", err)
 	}
 	if !bytes.Equal(original, recovered) {
 		t.Fatal("sector data mismatch after UDRW→UDSP→UDRW round-trip")
@@ -100,7 +107,7 @@ func TestResizeUDRW_Grow(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "disk.udif")
 	original := makeTestSectors(2048) // 1 MiB
-	if err := writeUDIF(path, original, udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, original, encRaw); err != nil {
 		t.Fatalf("writeUDIF: %v", err)
 	}
 
@@ -132,7 +139,7 @@ func TestResizeUDRW_Grow(t *testing.T) {
 func TestResizeUDRW_Shrink_Error(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "disk.udif")
-	if err := writeUDIF(path, makeTestSectors(2048), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, makeTestSectors(2048), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	if err := ResizeUDRW(path, 512*1024); err == nil {
@@ -143,7 +150,7 @@ func TestResizeUDRW_Shrink_Error(t *testing.T) {
 func TestResizeUDRW_Noop(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "disk.udif")
-	if err := writeUDIF(path, makeTestSectors(2048), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, makeTestSectors(2048), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	if err := ResizeUDRW(path, 1024*1024); err != nil {
@@ -263,7 +270,7 @@ func TestConvertUDIF_UDRW_to_UDZO_and_back(t *testing.T) {
 	dir := t.TempDir()
 	original := makeTestSectors(4096) // 2 MiB, spans multiple zlib chunks
 	srcPath := filepath.Join(dir, "src.udif")
-	if err := writeUDIF(srcPath, original, udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(srcPath, original, encRaw); err != nil {
 		t.Fatalf("writeUDIF: %v", err)
 	}
 
@@ -281,9 +288,9 @@ func TestConvertUDIF_UDRW_to_UDZO_and_back(t *testing.T) {
 	if err := ConvertUDIF(zoPath, dstPath, "UDRW"); err != nil {
 		t.Fatalf("ConvertUDIF UDZO→UDRW: %v", err)
 	}
-	recovered, _, err := readAllUDIFSectors(dstPath)
+	recovered, err := readSectors(dstPath)
 	if err != nil {
-		t.Fatalf("readAllUDIFSectors after UDZO round-trip: %v", err)
+		t.Fatalf("readSectors after UDZO round-trip: %v", err)
 	}
 	if !bytes.Equal(recovered, original) {
 		t.Fatal("UDZO round-trip: sector data mismatch")
@@ -303,7 +310,7 @@ func TestWriteUDIF_Checksums(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ck.dmg")
 	sectors := makeTestSectors(2048)
-	if err := writeUDIF(path, sectors, udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, sectors, encRaw); err != nil {
 		t.Fatalf("writeUDIF: %v", err)
 	}
 	// Read back the koly block. Its two checksum slots are deliberately
@@ -360,7 +367,7 @@ func TestReadAllUDIFSectors_ChecksumVerification(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ck.dmg")
 	sectors := makeTestSectors(2048)
-	if err := writeUDIF(path, sectors, udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, sectors, encRaw); err != nil {
 		t.Fatalf("writeUDIF: %v", err)
 	}
 	// Corrupt a sector byte mid-file (not in plist/koly region).
@@ -382,7 +389,7 @@ func TestReadAllUDIFSectors_MultiSegmentError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg.dmg")
 	sectors := makeTestSectors(2048)
-	if err := writeUDIF(path, sectors, udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, sectors, encRaw); err != nil {
 		t.Fatalf("writeUDIF: %v", err)
 	}
 	// Patch segmentCount to 2 in the koly block.
@@ -658,7 +665,7 @@ func TestFillSectorsFromRuns_DecompressError(t *testing.T) {
 
 func TestIsUDIF_True(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "valid.dmg")
-	if err := writeUDIF(path, makeTestSectors(2), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, makeTestSectors(2), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	if !IsUDIF(path) {
@@ -681,7 +688,7 @@ func TestIsUDIF_False(t *testing.T) {
 func TestUnpackToTemp_Success(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.dmg")
 	sectors := makeTestSectors(4)
-	if err := writeUDIF(path, sectors, udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, sectors, encRaw); err != nil {
 		t.Fatal(err)
 	}
 	tmp, err := UnpackToTemp(path)
@@ -708,7 +715,7 @@ func TestUnpackToTemp_BadSrc(t *testing.T) {
 func TestUnpackToTemp_CreateTempError(t *testing.T) {
 	// Force os.CreateTemp to fail by pointing TMPDIR to a non-existent directory.
 	path := filepath.Join(t.TempDir(), "disk.dmg")
-	if err := writeUDIF(path, makeTestSectors(2), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, makeTestSectors(2), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "nonexistent"))
@@ -819,7 +826,7 @@ func TestWrapRaw_BadPath(t *testing.T) {
 
 func TestResizeUDRW_ZeroSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.dmg")
-	if err := writeUDIF(path, makeTestSectors(2), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, makeTestSectors(2), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	if err := ResizeUDRW(path, 0); err == nil {
@@ -846,7 +853,7 @@ func TestConvertUDIF_BadDst(t *testing.T) {
 	// Create a valid UDRW src but write to an unwritable directory.
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.dmg")
-	if err := writeUDIF(src, makeTestSectors(2), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(src, makeTestSectors(2), encRaw); err != nil {
 		t.Fatalf("writeUDIF: %v", err)
 	}
 	readOnly := filepath.Join(dir, "ro")
@@ -889,7 +896,7 @@ func TestFormatToRaw_RenameFailFallback(t *testing.T) {
 	// causing ToRaw to fall through to dmgCopyFile (line 53 in format.go).
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.dmg")
-	if err := writeUDIF(src, makeTestSectors(2), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(src, makeTestSectors(2), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	// dst is an existing directory — Rename will fail, dmgCopyFile will also fail
@@ -926,7 +933,7 @@ func TestDmgCopyFile_BadDst(t *testing.T) {
 func TestFormatResize_Shrink(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "disk.dmg")
-	if err := writeUDIF(path, makeTestSectors(4096), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, makeTestSectors(4096), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	// Shrink to 1 MiB (half)
@@ -1204,7 +1211,7 @@ func injectCloseError(t *testing.T) {
 
 func TestReadAllUDIFSectors_StatError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.dmg")
-	if err := writeUDIF(path, makeTestSectors(2), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, makeTestSectors(2), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	injectStatError(t)
@@ -1216,7 +1223,7 @@ func TestReadAllUDIFSectors_StatError(t *testing.T) {
 
 func TestReadAllUDIFSectors_ReadAtError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.dmg")
-	if err := writeUDIF(path, makeTestSectors(2), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, makeTestSectors(2), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	injectReadAtError(t)
@@ -1228,7 +1235,7 @@ func TestReadAllUDIFSectors_ReadAtError(t *testing.T) {
 
 func TestDetectUDIFFormat_StatError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.dmg")
-	if err := writeUDIF(path, makeTestSectors(2), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, makeTestSectors(2), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	injectStatError(t)
@@ -1240,7 +1247,7 @@ func TestDetectUDIFFormat_StatError(t *testing.T) {
 
 func TestDetectUDIFFormat_ReadAtError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.dmg")
-	if err := writeUDIF(path, makeTestSectors(2), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, makeTestSectors(2), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	injectReadAtError(t)
@@ -1252,7 +1259,7 @@ func TestDetectUDIFFormat_ReadAtError(t *testing.T) {
 
 func TestWriteUDIF_WriteChunkError(t *testing.T) {
 	injectWriteError(t)
-	err := writeUDIF(filepath.Join(t.TempDir(), "out.dmg"), makeTestSectors(2), udifVariantCodes["UDRW"])
+	err := writeUDIF(filepath.Join(t.TempDir(), "out.dmg"), makeTestSectors(2), encRaw)
 	if err == nil {
 		t.Fatal("expected error from injected write failure in writeUDIF (chunk)")
 	}
@@ -1271,7 +1278,7 @@ func TestWriteUDIF_WriteKolyError(t *testing.T) {
 		return orig(f, b)
 	}
 	t.Cleanup(func() { osWriteFile = orig })
-	err := writeUDIF(filepath.Join(t.TempDir(), "out.dmg"), makeTestSectors(2), udifVariantCodes["UDRW"])
+	err := writeUDIF(filepath.Join(t.TempDir(), "out.dmg"), makeTestSectors(2), encRaw)
 	if err == nil {
 		t.Fatal("expected error from injected write failure in writeUDIF (koly)")
 	}
@@ -1279,7 +1286,7 @@ func TestWriteUDIF_WriteKolyError(t *testing.T) {
 
 func TestUnpackToTemp_WriteError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.dmg")
-	if err := writeUDIF(path, makeTestSectors(2), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, makeTestSectors(2), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	injectWriteError(t)
@@ -1291,7 +1298,7 @@ func TestUnpackToTemp_WriteError(t *testing.T) {
 
 func TestUnpackToTemp_CloseError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "disk.dmg")
-	if err := writeUDIF(path, makeTestSectors(2), udifVariantCodes["UDRW"]); err != nil {
+	if err := writeUDIF(path, makeTestSectors(2), encRaw); err != nil {
 		t.Fatal(err)
 	}
 	injectCloseError(t)
