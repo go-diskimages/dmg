@@ -38,6 +38,33 @@ jobs:
           echo "total coverage: ${total}%"
           awk -v c="$total" 'BEGIN { if (c+0 < 100.0) { print "coverage below 100.0%"; exit 1 } }'
 
+  # The strict judge. udif_hdiutil_darwin_test.go says why it exists: this
+  # package's only external reader was qemu-img, which is lenient -- every
+  # image it wrote passed there while macOS refused all of them, and two
+  # defects hid behind that for as long as the package existed.
+  #
+  # The lenient reader runs on every push. The strict one ran nowhere, because
+  # nothing in this repository was ever a Mac. `hdiutil attach` on an image
+  # file needs no privilege, so an ordinary macos runner is enough.
+  #
+  # A separate job rather than a leg of `native`: that one gates on 100%
+  # coverage, and a darwin-only file changes what "total" means. This job
+  # judges; it does not count.
+  darwin:
+    name: hdiutil, the strict reader of what we write
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Test, with the hdiutil judge required
+        env:
+          # A skip here would look exactly like a pass -- and would leave the
+          # forgiving reader as the only opinion again.
+          DMG_REQUIRE_HDIUTIL: "1"
+        run: CGO_ENABLED=0 go test ./...
+
   emulated:
     name: emulated ${{ matrix.arch }}
     runs-on: ubuntu-latest
