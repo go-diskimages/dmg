@@ -29,6 +29,9 @@ var devRe = regexp.MustCompile(`/dev/disk\d+`)
 func TestHdiutilAttachesWhatWeWrite(t *testing.T) {
 	hdiutil, err := exec.LookPath("hdiutil")
 	if err != nil {
+		if requireHdiutil() {
+			t.Fatalf("DMG_REQUIRE_HDIUTIL is set but hdiutil is not present: %v", err)
+		}
 		t.Skip("hdiutil not present")
 	}
 	dir := t.TempDir()
@@ -40,6 +43,9 @@ func TestHdiutilAttachesWhatWeWrite(t *testing.T) {
 	mk := exec.Command(hdiutil, "create", "-size", "8m", "-fs", "HFS+",
 		"-volname", "UDIFProbe", "-layout", "NONE", "-ov", src)
 	if out, err := mk.CombinedOutput(); err != nil {
+		if requireHdiutil() {
+			t.Fatalf("hdiutil create failed: %v\n%s", err, out)
+		}
 		t.Skipf("hdiutil create unavailable here: %v\n%s", err, out)
 	}
 	raw, err := os.ReadFile(src)
@@ -79,6 +85,9 @@ func TestHdiutilAttachesWhatWeWrite(t *testing.T) {
 func TestHdiutilAttachesOurUDZO(t *testing.T) {
 	hdiutil, err := exec.LookPath("hdiutil")
 	if err != nil {
+		if requireHdiutil() {
+			t.Fatalf("DMG_REQUIRE_HDIUTIL is set but hdiutil is not present: %v", err)
+		}
 		t.Skip("hdiutil not present")
 	}
 	dir := t.TempDir()
@@ -86,6 +95,9 @@ func TestHdiutilAttachesOurUDZO(t *testing.T) {
 	mk := exec.Command(hdiutil, "create", "-size", "8m", "-fs", "HFS+",
 		"-volname", "UDZOProbe", "-layout", "NONE", "-ov", src)
 	if out, err := mk.CombinedOutput(); err != nil {
+		if requireHdiutil() {
+			t.Fatalf("hdiutil create failed: %v\n%s", err, out)
+		}
 		t.Skipf("hdiutil create unavailable here: %v\n%s", err, out)
 	}
 	raw := filepath.Join(dir, "raw.dmg")
@@ -120,3 +132,16 @@ func TestHdiutilAttachesOurUDZO(t *testing.T) {
 		t.Errorf("attached but did not mount:\n%s", out)
 	}
 }
+
+// requireHdiutil reports whether this lane promised hdiutil would be there.
+//
+// DMG_REQUIRE_HDIUTIL=1 turns every exit in this file into a failure. The
+// macOS lane sets it, because the whole reason this file exists is that the
+// package's only other external reader -- qemu-img -- accepts images macOS
+// refuses, and a judge that can quietly not run is worth no more than the
+// lenient one it was added to correct.
+//
+// It covers the "hdiutil create failed" exits too, not just the missing
+// binary: those are failures of the tool on a machine that has it, and a
+// failure of the judge must never read as a pass for the subject.
+func requireHdiutil() bool { return os.Getenv("DMG_REQUIRE_HDIUTIL") != "" }
