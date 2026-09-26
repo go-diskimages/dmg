@@ -15,6 +15,7 @@ package dmg
 
 import (
 	"bytes"
+	"compress/bzip2"
 	"compress/zlib"
 	"encoding/base64"
 	"encoding/binary"
@@ -28,6 +29,8 @@ import (
 	"unicode"
 
 	"github.com/go-compressions/lzfse"
+
+	"github.com/go-diskimages/dmg/adc"
 )
 
 // osStatFile is the function used to stat an open file. Overridable in tests.
@@ -73,9 +76,21 @@ const (
 	blkxRaw    = uint32(0x00000001) // raw / uncompressed
 	blkxIgnore = uint32(0x00000002) // zero-fill, stored length may be non-zero
 	blkxFree   = uint32(0x7FFFFFFE) // unallocated
-	blkxLzfse  = uint32(0x80000004) // LZFSE compressed (Apple, macOS 10.12+)
-	blkxZlib   = uint32(0x80000005) // zlib compressed
-	blkxTerm   = uint32(0xFFFFFFFF) // terminator
+	// These four were read off images hdiutil itself wrote: a raw file was
+	// converted to each of the four compressed flavours and the block types in
+	// the resulting blkx tables read back. 0x80000004 used to be labelled
+	// LZFSE here, which is what made a real UDCO image get handed to the LZFSE
+	// decoder and a real ULFO image refused as an unknown type. Only UDZO was
+	// ever read correctly, because only UDZO's number happened to be right.
+	//
+	//	UDCO -> 0x80000004    UDZO -> 0x80000005
+	//	UDBZ -> 0x80000006    ULFO -> 0x80000007
+	blkxADC   = uint32(0x80000004) // ADC compressed ("UDCO")
+	blkxZlib  = uint32(0x80000005) // zlib compressed ("UDZO")
+	blkxBzip2 = uint32(0x80000006) // bzip2 compressed ("UDBZ", deprecated by Apple)
+	blkxLzfse = uint32(0x80000007) // LZFSE compressed ("ULFO", macOS 10.12+)
+
+	blkxTerm = uint32(0xFFFFFFFF) // terminator
 
 	blkxChecksumCRC32 = uint32(0x00000002)
 )
@@ -352,6 +367,30 @@ func decompressRun(f io.ReaderAt, dataOffset uint64, r blkxRun) ([]byte, error) 
 			return nil, fmt.Errorf("blkx lzfse: decompressed %d bytes, want %d", len(dec), len(out))
 		}
 		copy(out, dec)
+	case blkxADC:
+		comp := make([]byte, r.compressedLength)
+		if _, err := f.ReadAt(comp, int64(dataOffset+r.compressedOffset)); err != nil {
+			return nil, fmt.Errorf("blkx adc read: %w", err)
+		}
+		dec, err := adc.Decompress(comp)
+		if err != nil {
+			return nil, fmt.Errorf("blkx adc decompress: %w", err)
+		}
+		// ADC carries no output length, so the run's sector count is the only
+		// statement of how long this chunk should be. Disagreeing with it means
+		// the stream is not the chunk the table says it is.
+		if len(dec) != len(out) {
+			return nil, fmt.Errorf("blkx adc: decompressed %d bytes, want %d", len(dec), len(out))
+		}
+		copy(out, dec)
+	case blkxBzip2:
+		comp := make([]byte, r.compressedLength)
+		if _, err := f.ReadAt(comp, int64(dataOffset+r.compressedOffset)); err != nil {
+			return nil, fmt.Errorf("blkx bzip2 read: %w", err)
+		}
+		if _, err := io.ReadFull(bzip2.NewReader(bytes.NewReader(comp)), out); err != nil {
+			return nil, fmt.Errorf("blkx bzip2 decompress: %w", err)
+		}
 	case blkxTerm:
 		// terminator, no data
 	default:
@@ -809,6 +848,10 @@ func DetectUDIFFormat(path string) (string, error) {
 		return "UDZO", nil
 	case seen[blkxLzfse]:
 		return "ULFO", nil
+	case seen[blkxADC]:
+		return "UDCO", nil
+	case seen[blkxBzip2]:
+		return "UDBZ", nil
 	case seen[blkxNocopy]:
 		// A zero-fill run means zero sectors were ELIDED rather than stored,
 		// which is the whole of what UDSP is. buildRunsForRaw never emits one
@@ -832,7 +875,13 @@ func DetectUDIFFormat(path string) (string, error) {
 
 // ConvertUDIF reads all sectors from src and writes them to dst in dstFormat.
 // Supported write formats: "UDRW", "UDRO", "UDSP", "UDZO".
-// "UDCO" (ADC) and "UDBZ" (bzip2) are not yet supported for writing.
+//
+// "UDCO" (ADC), "UDBZ" (bzip2) and "ULFO" (LZFSE) can be READ but not written,
+// and writeSectors refuses them by name rather than re-encoding them as
+// something else. That refusal became load-bearing the moment the three
+// became readable: while the reader rejected them, a resize could not get far
+// enough to rewrite one, so the misdetection that called a UDBZ "UDRO" -- and
+// so mapped it onto the raw writer -- could never fire.
 // For UDSP, zero sectors are stored as NOCOPY (no data) runs.
 // For UDZO, sectors are compressed with zlib.
 func ConvertUDIF(src, dst, dstFormat string) error {

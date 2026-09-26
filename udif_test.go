@@ -1381,3 +1381,89 @@ func TestDmgCopyFile_CopyError(t *testing.T) {
 		t.Fatal("expected error from injected copy failure in dmgCopyFile")
 	}
 }
+
+// ─── ADC and bzip2 runs ───────────────────────────────────────────────────────
+//
+// The happy path for both is covered against images hdiutil wrote, in
+// hdiutil_golden_test.go. What is left here are the refusals, which a real
+// image does not contain.
+
+// adcLiterals codes b as ADC literal runs, the one opcode that needs no
+// history. A run carries at most 128 bytes, so a sector takes four of them.
+func adcLiterals(b []byte) []byte {
+	var out []byte
+	for len(b) > 0 {
+		n := min(len(b), 128)
+		out = append(out, 0x80|byte(n-1))
+		out = append(out, b[:n]...)
+		b = b[n:]
+	}
+	return out
+}
+
+func TestDecompressRun_ADC(t *testing.T) {
+	sectors := makeTestSectors(1)
+	compressed := adcLiterals(sectors)
+	run := blkxRun{blockType: blkxADC, sectorNumber: 0, sectorCount: 1,
+		compressedOffset: 0, compressedLength: uint64(len(compressed))}
+	got, err := decompressRun(bytes.NewReader(compressed), 0, run)
+	if err != nil {
+		t.Fatalf("decompressRun adc: %v", err)
+	}
+	if !bytes.Equal(got, sectors) {
+		t.Fatal("adc decompression produced wrong data")
+	}
+}
+
+func TestDecompressRun_ADCReadError(t *testing.T) {
+	run := blkxRun{blockType: blkxADC, sectorNumber: 0, sectorCount: 1,
+		compressedOffset: 1000, compressedLength: 10}
+	if _, err := decompressRun(bytes.NewReader([]byte{1, 2, 3}), 0, run); err == nil {
+		t.Fatal("expected error reading adc run from short reader")
+	}
+}
+
+func TestDecompressRun_ADCCorrupt(t *testing.T) {
+	// A literal opcode announcing a byte that is not there.
+	compressed := []byte{0x80}
+	run := blkxRun{blockType: blkxADC, sectorNumber: 0, sectorCount: 1,
+		compressedOffset: 0, compressedLength: uint64(len(compressed))}
+	_, err := decompressRun(bytes.NewReader(compressed), 0, run)
+	if err == nil {
+		t.Fatal("expected error for a truncated adc stream")
+	}
+	t.Logf("error (expected): %v", err)
+}
+
+func TestDecompressRun_ADCSizeMismatch(t *testing.T) {
+	// One sector of data under a run that claims two. ADC carries no output
+	// length of its own, so the run's sector count is the only thing that can
+	// catch this.
+	compressed := adcLiterals(makeTestSectors(1))
+	run := blkxRun{blockType: blkxADC, sectorNumber: 0, sectorCount: 2,
+		compressedOffset: 0, compressedLength: uint64(len(compressed))}
+	_, err := decompressRun(bytes.NewReader(compressed), 0, run)
+	if err == nil {
+		t.Fatal("expected error for adc size mismatch")
+	}
+	t.Logf("error (expected): %v", err)
+}
+
+func TestDecompressRun_Bzip2ReadError(t *testing.T) {
+	run := blkxRun{blockType: blkxBzip2, sectorNumber: 0, sectorCount: 1,
+		compressedOffset: 1000, compressedLength: 10}
+	if _, err := decompressRun(bytes.NewReader([]byte{1, 2, 3}), 0, run); err == nil {
+		t.Fatal("expected error reading bzip2 run from short reader")
+	}
+}
+
+func TestDecompressRun_Bzip2Corrupt(t *testing.T) {
+	compressed := []byte("BZh9 this is not a bzip2 stream")
+	run := blkxRun{blockType: blkxBzip2, sectorNumber: 0, sectorCount: 1,
+		compressedOffset: 0, compressedLength: uint64(len(compressed))}
+	_, err := decompressRun(bytes.NewReader(compressed), 0, run)
+	if err == nil {
+		t.Fatal("expected error for a corrupt bzip2 stream")
+	}
+	t.Logf("error (expected): %v", err)
+}
