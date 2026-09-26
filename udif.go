@@ -152,7 +152,12 @@ type kolyBlock struct {
 	sectorCount           uint64
 	// CRC-32 checksums (type 0x00000002)
 	dataForkChecksum uint32 // CRC-32 of the data fork bytes
-	masterChecksum   uint32 // CRC-32 of all uncompressed sector bytes
+	// masterChecksum is CRC-32 of the 4-byte CRC each blkx table declares,
+	// concatenated -- a checksum of the checksums, NOT of any sector bytes. See
+	// masterChecksumOf, and note that it is read at koly+352: +160 lands inside
+	// the data-fork checksum's own data field, which is always zero, and reading
+	// it there is how this field came to be described as absent from every image.
+	masterChecksum uint32
 }
 
 func parseKoly(b []byte) (kolyBlock, error) {
@@ -694,7 +699,9 @@ func readAllUDIFSectors(path string) ([]byte, kolyBlock, error) {
 	}
 
 	sectors := make([]byte, koly.sectorCount*udifSectorSize)
+	tableBytes := make([][]byte, 0, len(items))
 	for _, item := range items {
+		tableBytes = append(tableBytes, item.Data)
 		tbl, runs, err := parseBlkxTable(item.Data)
 		if err != nil {
 			return nil, kolyBlock{}, fmt.Errorf("udif: parse blkx: %w", err)
@@ -713,11 +720,22 @@ func readAllUDIFSectors(path string) ([]byte, kolyBlock, error) {
 			return nil, kolyBlock{}, err
 		}
 	}
-	// masterChecksum is documented as CRC-32 of every uncompressed sector byte
-	// and is NOT enforced, for one reason: every image available to measure
-	// against leaves its slot empty (type 0), hdiutil included. A rule with no
-	// witness is a rule that fails the first time it meets a real file, so this
-	// package does not pretend to know that one yet.
+	// And the master checksum, which is a checksum OF THE CHECKSUMS rather than
+	// of any bytes in the image. See masterChecksumOf.
+	//
+	// ⛔ This was previously documented here as "CRC-32 of every uncompressed
+	// sector byte" and left unenforced, on the stated grounds that every image
+	// available left its slot empty. Both halves were wrong, and from the same
+	// mistake: the slot was read at koly+160, which is inside the DATA FIELD of
+	// the data-fork checksum and therefore always zero. It lives at koly+352.
+	// Read there, all nine images declare type 2 and a real value.
+	if koly.masterChecksum != 0 {
+		if got := masterChecksumOf(tableBytes); got != koly.masterChecksum {
+			return nil, kolyBlock{}, fmt.Errorf("udif: master checksum mismatch over "+
+				"%d blkx table checksums (declared 0x%08x, computed 0x%08x)",
+				len(tableBytes), koly.masterChecksum, got)
+		}
+	}
 	return sectors, koly, nil
 }
 
@@ -801,6 +819,34 @@ func fillSectorsFromRuns(f io.ReaderAt, tbl blkxTable, runs []blkxRun, sectors [
 	return sum.Sum32(), nil
 }
 
+// masterChecksumOf is the koly's master checksum: CRC-32 over the 4-byte CRC
+// value each blkx table declares, concatenated in table order.
+//
+// A checksum OF the checksums, not of the sectors. That is what `hdiutil verify`
+// prints as its second line, after the per-table one:
+//
+//	whole disk (unknown partition : 0): verified   CRC32 $E9D2CD5A
+//	verified   CRC32 $F1D42119
+//
+// and 0xF1D42119 is crc32 of the four bytes E9 D2 CD 5A. Measured on nine images
+// hdiutil wrote, from one table to two.
+//
+// ⛔ Tables whose checksum is ZERO are included. Only a multi-table image can show
+// that, and one was needed to: an ISO in a UDZO has an Apple_ISO table with a real
+// CRC and an Apple_Free table declaring zero, and skipping the zero gives
+// 0x0AB9C74B where hdiutil declares 0x2C637C0A. Every single-table image agrees
+// with both rules.
+func masterChecksumOf(tables [][]byte) uint32 {
+	h := crc32.NewIEEE()
+	for _, t := range tables {
+		if len(t) < 76 {
+			continue
+		}
+		h.Write(t[72:76])
+	}
+	return h.Sum32()
+}
+
 // producedCRC is the writer's side of runProducesData: the CRC-32 of the sectors
 // the runs actually store, in run order, skipping the ones that only zero-fill.
 //
@@ -862,22 +908,21 @@ func writeUDIF(path string, sectors []byte, enc runEncoding) error {
 	default:
 		runs, dataFork = buildRunsForRaw(sectors)
 	}
-	// Checksums.
+	// Checksums. All three of them.
 	//
-	// The blkx table carries a CRC-32 of the uncompressed sectors, which is
-	// what a reader uses and what qemu-img checks. The two KOLY checksum
-	// blocks are a different matter: declaring type 2 / 32 bits there makes
-	// hdiutil VALIDATE them, and the value written here was rejected --
-	// measured on macOS 26, one variable at a time:
+	// The two KOLY blocks used to be written as type 0, "no checksum", because
+	// declaring type 2 makes hdiutil VALIDATE them and the values written here
+	// were rejected -- measured on macOS 26, one variable at a time:
 	//
 	//	imageVariant 2 + koly checksums type 2 -> "invalid checksum"
-	//	imageVariant 2 + koly checksums type 0 -> attaches, mounts, reads
+	//	imageVariant 2 + koly checksums type 0 -> opened, but hdiutil verify
+	//	                                          answered "has no checksum"
 	//
-	// So the koly blocks are left as type 0 ("no checksum"), which is a
-	// legitimate UDIF encoding, rather than carrying a value that is wrong.
-	// Writing a CORRECT koly checksum is worth doing; claiming one we cannot
-	// compute is not, and an image that will not mount is a worse outcome
-	// than one that is merely unverified.
+	// That reasoning ended with "writing a CORRECT koly checksum is worth doing",
+	// and this is that: the master one is a CRC of the blkx tables' CRCs and not
+	// of any sectors, which is what the rejected value had got wrong. With both
+	// right, `hdiutil verify` calls an image this package writes VALID -- which is
+	// how the judge for this package stopped needing to mount one.
 	// The checksum covers the bytes the PRODUCING runs put in the image, not every
 	// sector -- which is Apple's rule, measured, and was not this writer's. UDSP
 	// elides zero sectors into NOCOPY runs, so the two differ there and only
@@ -895,9 +940,13 @@ func writeUDIF(path string, sectors []byte, enc runEncoding) error {
 		dataForkLength: xmlOff, segmentNumber: 1, segmentCount: 1,
 		xmlOffset: xmlOff, xmlLength: uint64(len(plistBytes)),
 		imageVariant: imageVariantWholeDisk, sectorCount: n,
-		// left zero on purpose: see the note above
-		dataForkChecksum: 0,
-		masterChecksum:   0,
+		// Both koly checksums, and they are the reason `hdiutil verify` has
+		// anything to say about an image this package wrote. It used to leave both
+		// empty, so verify answered "has no checksum" and the only outside opinion
+		// left was `hdiutil attach` -- which means mounting a disk, which is a
+		// heavier thing to do than reading one.
+		dataForkChecksum: crc32.ChecksumIEEE(dataFork),
+		masterChecksum:   masterChecksumOf([][]byte{tblBytes}),
 	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {

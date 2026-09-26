@@ -101,10 +101,64 @@ it decodes to. zlib's own Adler-32 does not save a zlib run either —
 before this was enforced: one flipped byte in a 5 KiB UDZO gave back a 900 KiB
 image with a different SHA-256, the right length, and **no error**.
 
-`masterChecksum` is documented as CRC-32 over every uncompressed sector byte and
-is **not** enforced: every image available to measure against leaves its slot
-empty, `hdiutil` included, so there is no witness for that one and this package
-does not pretend to know it.
+`masterChecksum` is verified too, and it is **not** a checksum of any sector: it is
+CRC-32 over the four-byte CRC each blkx table declares, concatenated in table
+order — a checksum of the checksums. `hdiutil verify` prints both, one after the
+other:
+
+```
+  whole disk (unknown partition : 0): verified   CRC32 $E9D2CD5A
+verified   CRC32 $F1D42119
+```
+
+and `$F1D42119` is the CRC-32 of the four bytes `E9 D2 CD 5A`. Tables declaring
+**zero are included** — only a multi-table image can show that, and one was needed
+to: skipping the zero table of an ISO-in-UDZO gives `0x0AB9C74B` where hdiutil
+declares `0x2C637C0A`, while every single-table image agrees with both rules.
+
+This file said the opposite until today — "not enforced, every image leaves its
+slot empty" — and both halves came from one mistake: the slot was read at
+`koly+160`, which is inside the *data field* of the data-fork checksum and
+therefore always zero. It lives at `koly+352`.
+
+### The judge does not mount anything
+
+`hdiutil` is this package's outside opinion, because its only other external
+reader — `qemu-img` — accepts images macOS refuses. It used to be asked by
+**mounting** the image: `hdiutil attach`, plus `hdiutil create -fs HFS+` to make a
+mountable payload, which attaches a device of its own. Two block devices per test
+run, to answer a question about a file format.
+
+It is asked three other ways now, none of which mounts anything — and the writer
+declares correct koly checksums, which is what made the first of them possible:
+
+| | |
+|---|---|
+| `hdiutil verify` | checks both koly checksums and every blkx one |
+| `hdiutil imageinfo` | parses the koly, the plist and the blkx tables |
+| `hdiutil convert` | decodes every chunk through Apple's own decoder |
+
+**Not a weaker judge, and measured rather than assumed.** Each defect the mounting
+test had caught was put back in the writer and all three asked:
+
+| defect | `verify` | `imageinfo` | `convert` |
+|---|---|---|---|
+| `imageVariant` written as a format code | refused | refused | refused |
+| `BuffersNeeded` left at zero | refused | refused | refused (UDZO only) |
+| blkx header 200 bytes instead of 204 | refused | refused | refused |
+| master checksum wrong by one bit | **refused** | accepted | accepted |
+
+The last row is why `verify` is not optional: it is the only one that looks at the
+koly's own checksums. The second is the one the mounting test existed for, and it
+survives — still only on the compressed flavour, exactly as before. And `convert`
+adds an assertion mounting could not make: the decoded bytes are compared with what
+went in.
+
+A test that reaches for a block device now **fails here**, rather than in somebody's
+Finder: `TestNothingHereTouchesABlockDevice` sweeps this package's own sources for
+`attach`, `detach`, `hdiutil create`, `diskutil`, `/dev/disk` and the `newfs_`
+family, and a second test asserts that sweep would actually match the line it
+exists to catch.
 
 ## Public API
 

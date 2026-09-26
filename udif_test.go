@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -313,15 +314,18 @@ func TestWriteUDIF_Checksums(t *testing.T) {
 	if err := writeUDIF(path, sectors, encRaw); err != nil {
 		t.Fatalf("writeUDIF: %v", err)
 	}
-	// Read back the koly block. Its two checksum slots are deliberately
-	// EMPTY, and the blkx table carries the checksum instead.
+
+	// Both koly checksum slots are FILLED, and each is checked against its own
+	// definition rather than against the writer -- otherwise this would assert
+	// that the writer agrees with itself.
 	//
-	// This test used to assert the opposite. Declaring type 2 in the koly
-	// made hdiutil validate a value it rejected -- measured on macOS 26,
-	// "invalid checksum", with everything else held constant -- so the image
-	// would not attach at all. An unverified image that mounts beats a
-	// verified-looking one that does not, and the blkx checksum this package
-	// writes IS correct, so integrity checking lost nothing.
+	// This test twice asserted the opposite, and both times the reason lay in the
+	// value rather than in the field. Declaring type 2 with a value hdiutil
+	// rejects makes an image refuse to open at all, which is worse than declaring
+	// nothing, so the slots were emptied. What was wrong was the VALUE: the master
+	// checksum is a CRC of the blkx tables' CRCs, not of the sectors. With both
+	// computed the way Apple computes them, `hdiutil verify` calls an image this
+	// package writes VALID -- and that is the judge that replaced mounting one.
 	f, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -336,13 +340,18 @@ func TestWriteUDIF_Checksums(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseKoly: %v", err)
 	}
-	if koly.dataForkChecksum != 0 {
-		t.Errorf("dataForkChecksum = 0x%08x, want 0 (type 0, no checksum)", koly.dataForkChecksum)
+
+	// The data fork is the bytes the koly names, and its checksum covers exactly
+	// those.
+	fork := make([]byte, koly.dataForkLength)
+	if _, err := f.ReadAt(fork, int64(koly.dataForkOffset)); err != nil {
+		t.Fatalf("read the data fork: %v", err)
 	}
-	if koly.masterChecksum != 0 {
-		t.Errorf("masterChecksum = 0x%08x, want 0 (type 0, no checksum)", koly.masterChecksum)
+	if want := crc32.ChecksumIEEE(fork); koly.dataForkChecksum != want {
+		t.Errorf("dataForkChecksum = 0x%08x, want 0x%08x (CRC-32 of the %d fork bytes)",
+			koly.dataForkChecksum, want, len(fork))
 	}
-	// …and the blkx table does carry one.
+
 	plist := make([]byte, koly.xmlLength)
 	if _, err := f.ReadAt(plist, int64(koly.xmlOffset)); err != nil {
 		t.Fatalf("read plist: %v", err)
@@ -359,10 +368,23 @@ func TestWriteUDIF_Checksums(t *testing.T) {
 		t.Fatalf("parseBlkxTable: %v", err)
 	}
 	if tbl.checksumType != blkxChecksumCRC32 || tbl.checksum == 0 {
-		t.Errorf("blkx checksum type=%d value=0x%08x, want CRC-32 and non-zero", tbl.checksumType, tbl.checksum)
+		t.Errorf("blkx checksum type=%d value=0x%08x, want CRC-32 and non-zero",
+			tbl.checksumType, tbl.checksum)
+	}
+
+	// The master is a checksum OF that checksum -- four bytes in, not 1 MiB.
+	if want := crc32.ChecksumIEEE(items[0].Data[72:76]); koly.masterChecksum != want {
+		t.Errorf("masterChecksum = 0x%08x, want 0x%08x (CRC-32 of the table's own "+
+			"four checksum bytes)", koly.masterChecksum, want)
+	}
+	// And it is NOT a checksum of the sectors, which is what it was documented as
+	// for as long as it went unenforced. Asserting the difference keeps the two
+	// readings from being confused again.
+	if sectorsCRC := crc32.ChecksumIEEE(sectors); koly.masterChecksum == sectorsCRC {
+		t.Errorf("masterChecksum equals crc32 of the sectors (0x%08x), so this test "+
+			"cannot tell the two definitions apart", sectorsCRC)
 	}
 }
-
 func TestReadAllUDIFSectors_ChecksumVerification(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ck.dmg")
