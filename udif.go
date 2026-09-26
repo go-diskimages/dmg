@@ -699,39 +699,18 @@ func readAllUDIFSectors(path string) ([]byte, kolyBlock, error) {
 		if err != nil {
 			return nil, kolyBlock{}, fmt.Errorf("udif: parse blkx: %w", err)
 		}
-		if err := fillSectorsFromRuns(f, tbl, runs, sectors); err != nil {
+		sum, err := fillSectorsFromRuns(f, tbl, runs, sectors)
+		if err != nil {
 			return nil, kolyBlock{}, err
 		}
-		// A blkx table's UDIFChecksum is plain CRC-32 over the sectors that
-		// table covers -- its own sectorNumber..+sectorCount, not the whole
-		// image -- and it is checked on every image, not only on ours.
-		//
-		// It used to be checked only on images this package wrote, on the
-		// grounds that "Apple's CRC-32 over the same sectors is not
-		// crc32.ChecksumIEEE of the sector bytes", citing an hdiutil UDZO that
-		// declared 0x53eff58f where this computed 0xe823f5b4. That is not
-		// reproducible. Nine images written by hdiutil -- UDCO, UDZO, UDBZ and
-		// ULFO, from 4 KiB to 40 MiB, one of them 41 runs including zero-fill
-		// -- all agree with crc32.ChecksumIEEE over exactly this span, and all
-		// nine pass this check. Whatever that measurement compared, it was not
-		// a table's checksum against a table's sectors.
-		//
-		// Leaving it off had a cost, and it was not hypothetical: a single
-		// flipped byte in a zlib run produced a whole image of the wrong bytes
-		// and NO error, because io.ReadFull stops at the output length and so
-		// never reaches zlib's own Adler-32 either. Two checks were switched
-		// off and the second was hiding behind the first.
-		if tbl.checksumType == blkxChecksumCRC32 && tbl.checksum != 0 {
-			lo := tbl.sectorNumber * udifSectorSize
-			hi := lo + tbl.sectorCount*udifSectorSize
-			if hi > uint64(len(sectors)) {
-				hi = uint64(len(sectors))
-			}
-			if got := crc32.ChecksumIEEE(sectors[lo:hi]); got != tbl.checksum {
-				return nil, kolyBlock{}, fmt.Errorf("udif: blkx checksum mismatch over sectors %d..%d "+
-					"(declared 0x%08x, computed 0x%08x)",
-					tbl.sectorNumber, tbl.sectorNumber+tbl.sectorCount, tbl.checksum, got)
-			}
+		// A blkx table's UDIFChecksum is plain CRC-32, and what it covers is the
+		// bytes the table's PRODUCING runs put into the image -- not the span of
+		// sectors the table describes. The two are the same number in most images
+		// and not in one that zero-fills, which is the whole difficulty: see
+		// runProducesData for the measurement, and verifyBlkxChecksum for what
+		// this cost when it was got wrong.
+		if err := verifyBlkxChecksum(tbl, sum); err != nil {
+			return nil, kolyBlock{}, err
 		}
 	}
 	// masterChecksum is documented as CRC-32 of every uncompressed sector byte
@@ -740,6 +719,35 @@ func readAllUDIFSectors(path string) ([]byte, kolyBlock, error) {
 	// witness is a rule that fails the first time it meets a real file, so this
 	// package does not pretend to know that one yet.
 	return sectors, koly, nil
+}
+
+// verifyBlkxChecksum compares a table's declared CRC-32 against the bytes its
+// producing runs actually put into the image.
+//
+// This got shipped wrong once, and the way it went wrong is worth keeping. The
+// check had been restricted to images this package wrote, with a comment citing
+// a real hdiutil UDZO that declared 0x53eff58f where the code computed
+// 0xe823f5b4. The restriction was lifted on the strength of nine hdiutil images
+// that all agreed -- and every one of those nine turned out to have NO zero-fill
+// run in it, so "the table's sectors" and "the bytes the runs produced" were the
+// same bytes in all nine. The tenth image, a UDZO holding an HFS+ volume, has
+// two IGNORE runs and was refused.
+//
+// The original comment was right and the corpus that overruled it was blind in
+// exactly the one way that mattered. hdiutil only emits a zero-fill run when it
+// recognises the filesystem inside and can see its unused space, which is why
+// converting a raw file -- however large, however compressible -- never produces
+// one.
+func verifyBlkxChecksum(tbl blkxTable, computed uint32) error {
+	if tbl.checksumType != blkxChecksumCRC32 || tbl.checksum == 0 {
+		return nil
+	}
+	if computed != tbl.checksum {
+		return fmt.Errorf("udif: blkx checksum mismatch over the bytes produced for "+
+			"sectors %d..%d (declared 0x%08x, computed 0x%08x)",
+			tbl.sectorNumber, tbl.sectorNumber+tbl.sectorCount, tbl.checksum, computed)
+	}
+	return nil
 }
 
 // verifyDataFork checks the koly's CRC-32 over the compressed bytes it names.
@@ -768,20 +776,76 @@ func verifyDataFork(f io.ReaderAt, koly kolyBlock) error {
 	return nil
 }
 
-// fillSectorsFromRuns copies decompressed run data into the flat sectors buffer.
-func fillSectorsFromRuns(f io.ReaderAt, tbl blkxTable, runs []blkxRun, sectors []byte) error {
+// fillSectorsFromRuns copies decompressed run data into the flat sectors buffer,
+// and returns the CRC-32 of the bytes the PRODUCING runs put there.
+//
+// That second job belongs here and nowhere else: by the time the sectors are a
+// flat buffer, a zero-filled region is indistinguishable from a region of stored
+// zeros, and the two do not count the same. See verifyBlkxChecksum.
+func fillSectorsFromRuns(f io.ReaderAt, tbl blkxTable, runs []blkxRun, sectors []byte) (uint32, error) {
+	sum := crc32.NewIEEE()
 	for _, r := range runs {
 		if r.blockType == blkxTerm {
 			break
 		}
 		data, err := decompressRun(f, tbl.dataOffset, r)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		start := int64((tbl.sectorNumber + r.sectorNumber) * udifSectorSize)
 		copy(sectors[start:], data)
+		if runProducesData(r.blockType) {
+			sum.Write(data)
+		}
 	}
-	return nil
+	return sum.Sum32(), nil
+}
+
+// producedCRC is the writer's side of runProducesData: the CRC-32 of the sectors
+// the runs actually store, in run order, skipping the ones that only zero-fill.
+//
+// It takes the finished sector buffer rather than each run's bytes because the
+// writer has the whole image in hand, and a run's span into it is exactly what
+// the reader will put back there.
+func producedCRC(sectors []byte, runs []blkxRun) uint32 {
+	h := crc32.NewIEEE()
+	for _, r := range runs {
+		if !runProducesData(r.blockType) {
+			continue
+		}
+		lo := r.sectorNumber * udifSectorSize
+		hi := lo + r.sectorCount*udifSectorSize
+		if hi > uint64(len(sectors)) {
+			hi = uint64(len(sectors))
+		}
+		h.Write(sectors[lo:hi])
+	}
+	return h.Sum32()
+}
+
+// runProducesData says whether a run puts bytes into the image that came from
+// the file, as opposed to filling sectors with zeros it never stored.
+//
+// It decides what a blkx checksum covers. A zero-fill run contributes NOTHING to
+// it -- not its sectors, and not zeros standing in for them -- because the writer
+// computes the checksum over what it compresses and a zero-fill chunk compresses
+// nothing.
+//
+// Measured on a UDZO whose table mixes the two: three zlib runs and two IGNORE
+// runs over 8192 sectors, declared 0xe614f115, which is the CRC-32 of the
+// 1073664 bytes the three zlib runs produce and of nothing else. Over all 8192
+// sectors it is 0x86ff7e28.
+//
+// blkxIgnore is the witnessed one. blkxNocopy and blkxFree are treated the same
+// way on the same argument -- they store no data either -- and no image available
+// here carries one inside a table with a non-zero checksum, so that half is
+// reasoned rather than measured, and says so.
+func runProducesData(blockType uint32) bool {
+	switch blockType {
+	case blkxNocopy, blkxIgnore, blkxFree, blkxTerm:
+		return false
+	}
+	return true
 }
 
 // writeUDIF creates a UDIF image at path containing the provided sector data,
@@ -814,7 +878,13 @@ func writeUDIF(path string, sectors []byte, enc runEncoding) error {
 	// Writing a CORRECT koly checksum is worth doing; claiming one we cannot
 	// compute is not, and an image that will not mount is a worse outcome
 	// than one that is merely unverified.
-	sectorsCRC := crc32.ChecksumIEEE(sectors)
+	// The checksum covers the bytes the PRODUCING runs put in the image, not every
+	// sector -- which is Apple's rule, measured, and was not this writer's. UDSP
+	// elides zero sectors into NOCOPY runs, so the two differ there and only
+	// there: a CRC over all the sectors made every sparse image this package
+	// wrote declare a value its own reader now computes differently. Nothing
+	// noticed while nothing checked, on either side.
+	sectorsCRC := producedCRC(sectors, runs)
 	tblBytes := writeBlkxTable(blkxTable{sectorNumber: 0, sectorCount: n, dataOffset: 0}, runs, sectorsCRC)
 	plistBytes := writePlistBlkx([]blkxPlistItem{
 		{Attributes: "0x0050", Data: tblBytes, ID: "0", Name: "whole disk (UDIF)"},

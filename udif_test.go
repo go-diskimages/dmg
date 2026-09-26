@@ -655,7 +655,7 @@ func TestFillSectorsFromRuns_DecompressError(t *testing.T) {
 	// blkxRaw run pointing beyond reader bounds → decompressRun returns error
 	sectors := make([]byte, udifSectorSize)
 	run := blkxRun{blockType: blkxRaw, sectorCount: 1, compressedOffset: 1000, compressedLength: udifSectorSize}
-	err := fillSectorsFromRuns(bytes.NewReader([]byte{}), blkxTable{}, []blkxRun{run}, sectors)
+	_, err := fillSectorsFromRuns(bytes.NewReader([]byte{}), blkxTable{}, []blkxRun{run}, sectors)
 	if err == nil {
 		t.Fatal("expected error from decompressRun in fillSectorsFromRuns")
 	}

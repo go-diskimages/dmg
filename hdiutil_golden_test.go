@@ -512,3 +512,151 @@ func TestABlkxTableIsCheckedOverItsOwnSectorsNotTheWholeImage(t *testing.T) {
 		t.Errorf("sectors differ from what went in at byte %d", firstDifference(sectors, fork))
 	}
 }
+
+// One more embedded image: a UDZO whose blkx table MIXES runs that store data
+// with runs that only zero-fill.
+//
+// This is the case none of the other fixtures can reach. hdiutil emits a
+// zero-fill run only when it recognises the filesystem inside the image and can
+// see its unused space, so converting a raw file never produces one however large
+// or however compressible it is -- measured: a 40 MiB image of alternating zero,
+// pattern and random megabytes came out as 27 zlib runs and 13 raw runs and not
+// one zero-fill.
+//
+// The container is hdiutil's, which is the part under test. The HFS+ volume inside
+// it was written by go-filesystems/hfsplus, because authoring one with hdiutil
+// means attaching a block device; `hdiutil imageinfo` names its partition
+// "whole disk (Apple_HFS : 0)", so Apple's own tool agrees about what is there.
+//
+// No raw counterpart is embedded, and none is needed: Apple's declared checksum
+// IS the assertion about the bytes, and it is not ours.
+//
+//go:embed testdata/hdiutil-zerofill-UDZO.dmg
+var zeroFillImage embed.FS
+
+// TestABlkxChecksumSkipsTheRunsThatOnlyZeroFill.
+//
+// The rule is not "CRC-32 of the sectors this table describes". It is "CRC-32 of
+// the bytes this table's runs produced", and a zero-fill run produces none --
+// not even zeros standing in for its sectors.
+//
+// This fixture is the tenth image, and the one that overturned the other nine: a
+// check enforced on the span rule refused it, citing a mismatch, while nothing
+// about it is wrong.
+func TestABlkxChecksumSkipsTheRunsThatOnlyZeroFill(t *testing.T) {
+	img, err := zeroFillImage.ReadFile("testdata/hdiutil-zerofill-UDZO.dmg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "zerofill.dmg")
+	if err := os.WriteFile(path, img, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Premise, in two halves. Without both, this is just another image that reads.
+	tbl, runs := onlyBlkxTable(t, img)
+	if tbl.checksumType != blkxChecksumCRC32 || tbl.checksum == 0 {
+		t.Fatalf("the table declares no CRC-32 (type %d, value 0x%08x): there would "+
+			"be nothing here to get wrong", tbl.checksumType, tbl.checksum)
+	}
+	var producing, zeroFill int
+	for _, r := range runs {
+		switch {
+		case r.blockType == blkxTerm:
+		case runProducesData(r.blockType):
+			producing++
+		default:
+			zeroFill++
+		}
+	}
+	if producing == 0 || zeroFill == 0 {
+		t.Fatalf("the table has %d producing runs and %d zero-fill runs: it takes "+
+			"both for the two rules to give different answers", producing, zeroFill)
+	}
+	t.Logf("table: %d producing runs, %d zero-fill runs, declares 0x%08x",
+		producing, zeroFill, tbl.checksum)
+
+	// Accepting it is the assertion: Apple declared that value over its own reading
+	// of these sectors, so agreeing with it is agreeing about every byte.
+	got, err := UnpackToTemp(path)
+	if err != nil {
+		t.Fatalf("UnpackToTemp: %v", err)
+	}
+	defer os.Remove(got)
+	sectors, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// And the premise that matters most: the two rules really do disagree here, so
+	// this fixture can tell them apart.
+	lo := tbl.sectorNumber * udifSectorSize
+	hi := lo + tbl.sectorCount*udifSectorSize
+	if hi > uint64(len(sectors)) {
+		t.Fatalf("the table describes sectors past the end of the image (%d > %d)", hi, len(sectors))
+	}
+	if spanRule := crc32.ChecksumIEEE(sectors[lo:hi]); spanRule == tbl.checksum {
+		t.Fatalf("a CRC over the whole span also gives 0x%08x, so this fixture "+
+			"cannot tell the two rules apart", spanRule)
+	} else {
+		t.Logf("a CRC over the whole span would be 0x%08x, which is the wrong answer", spanRule)
+	}
+}
+
+// onlyBlkxTable returns the single blkx table of an image that has one.
+func onlyBlkxTable(t *testing.T, img []byte) (blkxTable, []blkxRun) {
+	t.Helper()
+	koly, err := parseKoly(img[len(img)-kolyBlockSize:])
+	if err != nil {
+		t.Fatalf("parseKoly: %v", err)
+	}
+	items, err := parsePlistBlkx(img[koly.xmlOffset : koly.xmlOffset+koly.xmlLength])
+	if err != nil {
+		t.Fatalf("parsePlistBlkx: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("%d blkx tables, want 1", len(items))
+	}
+	tbl, runs, err := parseBlkxTable(items[0].Data)
+	if err != nil {
+		t.Fatalf("parseBlkxTable: %v", err)
+	}
+	return tbl, runs
+}
+
+// TestABlkxTableWithNoChecksumIsNotJudged. This package's own writer used to
+// leave the slot at type 0, and an older image may still. Nothing declared means
+// nothing to compare against -- as distinct from a declared zero, which no writer
+// produces.
+func TestABlkxTableWithNoChecksumIsNotJudged(t *testing.T) {
+	for _, tbl := range []blkxTable{
+		{checksumType: 0, checksum: 0},
+		{checksumType: 0, checksum: 0x12345678},        // a value under no type
+		{checksumType: blkxChecksumCRC32, checksum: 0}, // a type with no value
+	} {
+		if err := verifyBlkxChecksum(tbl, 0xFFFFFFFF); err != nil {
+			t.Errorf("type %d value 0x%08x was judged anyway: %v",
+				tbl.checksumType, tbl.checksum, err)
+		}
+	}
+}
+
+// TestProducedCRCStopsAtTheEndOfTheImage.
+//
+// A run may declare more sectors than the image holds, and a checksum must not
+// read past the buffer to find out. This asserts the clamp by computing the same
+// value two ways: an overlong run over a short image, and an exact run over the
+// same bytes.
+func TestProducedCRCStopsAtTheEndOfTheImage(t *testing.T) {
+	sectors := bytes.Repeat([]byte{0x5A}, 2*udifSectorSize)
+
+	overlong := []blkxRun{{blockType: blkxRaw, sectorNumber: 0, sectorCount: 99}}
+	exact := []blkxRun{{blockType: blkxRaw, sectorNumber: 0, sectorCount: 2}}
+	if got, want := producedCRC(sectors, overlong), producedCRC(sectors, exact); got != want {
+		t.Errorf("an overlong run gave 0x%08x, want 0x%08x -- the same bytes are all "+
+			"there are", got, want)
+	}
+	if got, want := producedCRC(sectors, exact), crc32.ChecksumIEEE(sectors); got != want {
+		t.Errorf("producedCRC = 0x%08x over the whole image, want 0x%08x", got, want)
+	}
+}
