@@ -660,3 +660,60 @@ func TestProducedCRCStopsAtTheEndOfTheImage(t *testing.T) {
 		t.Errorf("producedCRC = 0x%08x over the whole image, want 0x%08x", got, want)
 	}
 }
+
+// TestAMasterChecksumThatDisagreesWithItsTablesIsRefused. The master is a checksum
+// OF the blkx checksums, so damaging it requires touching neither the sectors nor
+// any table: one bit in the koly, and nothing else about the image changes.
+func TestAMasterChecksumThatDisagreesWithItsTablesIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "good.dmg")
+	if err := writeUDIF(path, makeTestSectors(64), encRaw); err != nil {
+		t.Fatalf("writeUDIF: %v", err)
+	}
+	// Premise: intact, it reads.
+	if _, _, err := readAllUDIFSectors(path); err != nil {
+		t.Fatalf("the intact image does not read: %v", err)
+	}
+
+	img, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// masterChecksum's value is at koly+360, and the koly is the last 512 bytes.
+	at := len(img) - kolyBlockSize + 363
+	before := img[at]
+	img[at] ^= 0x01
+	bad := filepath.Join(dir, "bad.dmg")
+	if err := os.WriteFile(bad, img, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Premise: exactly one byte moved, and it is in the koly rather than in the
+	// sectors or the plist.
+	if img[at] == before {
+		t.Fatal("the flip changed nothing")
+	}
+
+	_, _, err = readAllUDIFSectors(bad)
+	if err == nil {
+		t.Fatal("an image whose master checksum disagrees with its tables was accepted")
+	}
+	if !strings.Contains(err.Error(), "master checksum") {
+		t.Errorf("err = %v, want the master checksum to be what refuses it: "+
+			"anything else means the flip was caught for another reason", err)
+	}
+	t.Logf("refused: %v", err)
+}
+
+// TestMasterChecksumOfSkipsATableTooShortToHaveOne. A blkx table shorter than its
+// own header cannot declare a checksum, and reading four bytes at offset 72 of it
+// would read past the slice. Skipping is the only answer that is not a panic.
+func TestMasterChecksumOfSkipsATableTooShortToHaveOne(t *testing.T) {
+	full := make([]byte, blkxHeaderSize)
+	copy(full[72:76], []byte{0xDE, 0xAD, 0xBE, 0xEF})
+
+	want := masterChecksumOf([][]byte{full})
+	got := masterChecksumOf([][]byte{full, make([]byte, 8)})
+	if got != want {
+		t.Errorf("a truncated table changed the answer: 0x%08x, want 0x%08x", got, want)
+	}
+}
