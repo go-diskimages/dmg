@@ -20,14 +20,29 @@ The native Apple disk image format used by macOS. A UDIF file ends with a 512-by
 
 The plist carries an array of `blkx` (mish) tables, each describing a sequence of sector runs. Each run is one of:
 
-| Run type   | Code         | Description                            |
-|------------|--------------|----------------------------------------|
-| RAW        | `0x00000001` | Uncompressed sectors stored verbatim   |
-| NOCOPY     | `0x00000000` | Zero-filled sectors (no stored data)   |
-| FREE       | `0x7FFFFFFE` | Unallocated, treated as zeros          |
-| LZFSE      | `0x80000004` | LZFSE compressed (Apple, macOS 10.12+) |
-| ZLIB       | `0x80000005` | zlib-compressed sectors                |
-| Terminator | `0xFFFFFFFF` | End-of-table marker                    |
+| Run type   | Code         | Description                             |
+|------------|--------------|-----------------------------------------|
+| RAW        | `0x00000001` | Uncompressed sectors stored verbatim    |
+| NOCOPY     | `0x00000000` | Zero-filled sectors (no stored data)    |
+| IGNORE     | `0x00000002` | Zero-filled; stored length may be set   |
+| FREE       | `0x7FFFFFFE` | Unallocated, treated as zeros           |
+| ADC        | `0x80000004` | ADC compressed — the `UDCO` flavour     |
+| ZLIB       | `0x80000005` | zlib compressed — the `UDZO` flavour    |
+| BZIP2      | `0x80000006` | bzip2 compressed — the `UDBZ` flavour   |
+| LZFSE      | `0x80000007` | LZFSE compressed — the `ULFO` flavour   |
+| Terminator | `0xFFFFFFFF` | End-of-table marker                     |
+
+These four numbers were read off images `hdiutil` itself wrote — a raw file
+converted to each flavour in turn, and the block types in the resulting `blkx`
+tables read back. This table used to give `0x80000004` as LZFSE, which is ADC:
+a real `UDCO` image was handed to the LZFSE decoder, and a real `ULFO` image
+refused as an unknown type. Only `UDZO` was ever read correctly, because only
+`UDZO`'s number happened to be right. Nothing saw it because every test for a
+compressed flavour built its image out of these same constants, so a wrong one
+agreed with itself.
+
+LZMA (`0x80000008`) is a real block type this package does not decode. A run of
+one is refused by number rather than guessed at.
 
 **Image variants:**
 
@@ -35,10 +50,22 @@ The plist carries an array of `blkx` (mish) tables, each describing a sequence o
 |--------|------|------|-------|---------------------------------------|
 | `UDRW` | 1    | ✓    | ✓     | Read-write, fixed size                |
 | `UDRO` | 2    | ✓    | ✓     | Read-only (stored as RAW)             |
-| `UDCO` | 3    | ✓    | —     | ADC compressed (write not supported)  |
+| `UDCO` | 3    | ✓    | —     | ADC compressed                        |
 | `UDZO` | 4    | ✓    | ✓     | zlib compressed (1 MiB chunks)        |
-| `UDBZ` | 5    | ✓    | —     | bzip2 compressed (write not supported)|
+| `UDBZ` | 5    | ✓    | —     | bzip2 compressed                      |
+| `ULFO` | —    | ✓    | —     | LZFSE compressed                      |
 | `UDSP` | 11   | ✓    | ✓     | Sparse (NOCOPY runs for zero sectors) |
+
+A flavour marked read-only here is **refused by name** when something tries to
+write it back, not re-encoded as something else. That refusal carries weight:
+`UDRO` maps onto the raw writer, so a `UDBZ` misdetected as `UDRO` came back
+uncompressed. While the reader rejected bzip2 that could never happen — the
+read failed first — which is to say the broken decoder was the only thing
+standing between a resize and a silently re-encoded image.
+
+The four compressed flavours are tested against images `hdiutil` wrote, all
+four made from the same raw file, each asserted to contain the block type its
+flavour uses before its decode is believed.
 
 ## Public API
 
@@ -51,7 +78,7 @@ func IsUDIF(path string) bool
 
 // ConvertUDIF reads all sectors from src and writes them to dst in dstFormat.
 // Supported write formats: UDRW, UDRO, UDSP (sparse), UDZO (zlib-compressed).
-// UDCO and UDBZ are not yet supported for writing and return an error.
+// UDCO, UDBZ and ULFO can be read but not written, and are refused by name.
 // Checksums (CRC-32) are written in the output koly and blkx headers.
 // Multi-segment images are not supported for reading and return an error.
 func ConvertUDIF(src, dst, dstFormat string) error
