@@ -227,10 +227,13 @@ type blkxTable struct {
 	sectorCount  uint64
 	dataOffset   uint64
 	// checksum is the blkx table's own CRC-32 of the UNCOMPRESSED sectors it
-	// describes (header +64 type, +68 size, +72 value). This is the checksum
-	// this package can compute correctly, and the one qemu-img validates, so
-	// it is what integrity checking hangs off -- not the koly block, whose
-	// value hdiutil rejects (see kolyToBytes).
+	// describes -- its own sectorNumber..+sectorCount, not the whole image
+	// (header +64 type, +68 size, +72 value). It is plain crc32.ChecksumIEEE,
+	// measured against nine images hdiutil wrote, and qemu-img validates it too.
+	//
+	// The koly's own dataForkChecksum is checked as well, by verifyDataFork; what
+	// this package still does not WRITE is a koly checksum, because hdiutil
+	// rejects the value it used to put there (see kolyToBytes).
 	checksumType uint32
 	checksum     uint32
 }
@@ -681,6 +684,15 @@ func readAllUDIFSectors(path string) ([]byte, kolyBlock, error) {
 	if err != nil {
 		return nil, kolyBlock{}, err
 	}
+	// The data fork is checked BEFORE anything is decoded, and its span comes
+	// from the koly rather than from any table, so there is nothing per-table to
+	// get wrong about it. It is also the only check that covers every codec: ADC
+	// and LZFSE carry no internal checksum at all, so without this a damaged run
+	// of either decodes to whatever it decodes to.
+	if err := verifyDataFork(f, koly); err != nil {
+		return nil, kolyBlock{}, err
+	}
+
 	sectors := make([]byte, koly.sectorCount*udifSectorSize)
 	for _, item := range items {
 		tbl, runs, err := parseBlkxTable(item.Data)
@@ -690,32 +702,70 @@ func readAllUDIFSectors(path string) ([]byte, kolyBlock, error) {
 		if err := fillSectorsFromRuns(f, tbl, runs, sectors); err != nil {
 			return nil, kolyBlock{}, err
 		}
-		// Integrity is checked only on images THIS package wrote, and the
-		// discriminator is honest rather than clever: our writer leaves the
-		// koly checksum slots empty (type 0), hdiutil always fills them.
+		// A blkx table's UDIFChecksum is plain CRC-32 over the sectors that
+		// table covers -- its own sectorNumber..+sectorCount, not the whole
+		// image -- and it is checked on every image, not only on ours.
 		//
-		// The reason for the restriction is measured. Apple's CRC-32 over the
-		// same sectors is not crc32.ChecksumIEEE of the sector bytes -- a
-		// genuine hdiutil UDZO declares 0x53eff58f where we compute
-		// 0xe823f5b4 -- so enforcing our definition on a foreign image would
-		// condemn a perfectly good DMG as corrupt. Until Apple's variant is
-		// worked out, the only checksums this package is entitled to judge
-		// are its own.
-		if koly.masterChecksum == 0 && koly.dataForkChecksum == 0 &&
-			tbl.checksumType == blkxChecksumCRC32 && tbl.checksum != 0 {
+		// It used to be checked only on images this package wrote, on the
+		// grounds that "Apple's CRC-32 over the same sectors is not
+		// crc32.ChecksumIEEE of the sector bytes", citing an hdiutil UDZO that
+		// declared 0x53eff58f where this computed 0xe823f5b4. That is not
+		// reproducible. Nine images written by hdiutil -- UDCO, UDZO, UDBZ and
+		// ULFO, from 4 KiB to 40 MiB, one of them 41 runs including zero-fill
+		// -- all agree with crc32.ChecksumIEEE over exactly this span, and all
+		// nine pass this check. Whatever that measurement compared, it was not
+		// a table's checksum against a table's sectors.
+		//
+		// Leaving it off had a cost, and it was not hypothetical: a single
+		// flipped byte in a zlib run produced a whole image of the wrong bytes
+		// and NO error, because io.ReadFull stops at the output length and so
+		// never reaches zlib's own Adler-32 either. Two checks were switched
+		// off and the second was hiding behind the first.
+		if tbl.checksumType == blkxChecksumCRC32 && tbl.checksum != 0 {
 			lo := tbl.sectorNumber * udifSectorSize
 			hi := lo + tbl.sectorCount*udifSectorSize
 			if hi > uint64(len(sectors)) {
 				hi = uint64(len(sectors))
 			}
 			if got := crc32.ChecksumIEEE(sectors[lo:hi]); got != tbl.checksum {
-				return nil, kolyBlock{}, fmt.Errorf("udif: blkx checksum mismatch (want 0x%08x, got 0x%08x)", tbl.checksum, got)
+				return nil, kolyBlock{}, fmt.Errorf("udif: blkx checksum mismatch over sectors %d..%d "+
+					"(declared 0x%08x, computed 0x%08x)",
+					tbl.sectorNumber, tbl.sectorNumber+tbl.sectorCount, tbl.checksum, got)
 			}
 		}
 	}
-	// The koly checksum slots are never verified: same reason as above, and
-	// this package no longer writes them at all.
+	// masterChecksum is documented as CRC-32 of every uncompressed sector byte
+	// and is NOT enforced, for one reason: every image available to measure
+	// against leaves its slot empty (type 0), hdiutil included. A rule with no
+	// witness is a rule that fails the first time it meets a real file, so this
+	// package does not pretend to know that one yet.
 	return sectors, koly, nil
+}
+
+// verifyDataFork checks the koly's CRC-32 over the compressed bytes it names.
+//
+// Measured against nine images hdiutil wrote: the value at koly+88 is
+// crc32.ChecksumIEEE of the dataForkLength bytes at dataForkOffset, exactly.
+// A zero value means the writer left the slot empty -- this package's own
+// writer does -- and there is then nothing to check.
+//
+// The fork is streamed rather than read in: it is the whole compressed image,
+// 13 MiB for a 40 MiB disk in the measurements above, and a checksum has no
+// reason to hold it.
+func verifyDataFork(f io.ReaderAt, koly kolyBlock) error {
+	if koly.dataForkChecksum == 0 || koly.dataForkLength == 0 {
+		return nil
+	}
+	h := crc32.NewIEEE()
+	if _, err := io.Copy(h, io.NewSectionReader(f, int64(koly.dataForkOffset), int64(koly.dataForkLength))); err != nil {
+		return fmt.Errorf("udif: reading the data fork to check it: %w", err)
+	}
+	if got := h.Sum32(); got != koly.dataForkChecksum {
+		return fmt.Errorf("udif: data fork checksum mismatch over %d bytes at %d "+
+			"(declared 0x%08x, computed 0x%08x)",
+			koly.dataForkLength, koly.dataForkOffset, koly.dataForkChecksum, got)
+	}
+	return nil
 }
 
 // fillSectorsFromRuns copies decompressed run data into the flat sectors buffer.
