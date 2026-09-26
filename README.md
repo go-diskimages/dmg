@@ -26,7 +26,7 @@ The plist carries an array of `blkx` (mish) tables, each describing a sequence o
 | NOCOPY     | `0x00000000` | Zero-filled sectors (no stored data)    |
 | IGNORE     | `0x00000002` | Zero-filled; stored length may be set   |
 | FREE       | `0x7FFFFFFE` | Unallocated, treated as zeros           |
-| ADC        | `0x80000004` | ADC compressed — the `UDCO` flavour     |
+| ADC        | `0x80000004` | ADC compressed — the `UDCO` flavour, decoded by [`go-compressions/adc`](https://github.com/go-compressions/adc) |
 | ZLIB       | `0x80000005` | zlib compressed — the `UDZO` flavour    |
 | BZIP2      | `0x80000006` | bzip2 compressed — the `UDBZ` flavour   |
 | LZFSE      | `0x80000007` | LZFSE compressed — the `ULFO` flavour   |

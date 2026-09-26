@@ -1,2 +1,4 @@
+github.com/go-compressions/adc v0.1.0 h1:+4W5XL0JbDAuuD3YcbAnMRtyQM35kK9pGAAzELe+tm4=
+github.com/go-compressions/adc v0.1.0/go.mod h1:kPyMMlq7usBJh/vfGw8Z0cR852+dqZYYvBM6lpX4og0=
 github.com/go-compressions/lzfse v0.3.0 h1:slxIjY9HeG2llJSoXTwTnQ+u/iKMbr2WHUwaNAl/2yI=
 github.com/go-compressions/lzfse v0.3.0/go.mod h1:geg9IRFbMNHPgbm8xNwF3AnYTsldTX9YptJ0DOWzYv8=
