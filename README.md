@@ -67,6 +67,31 @@ The four compressed flavours are tested against images `hdiutil` wrote, all
 four made from the same raw file, each asserted to contain the block type its
 flavour uses before its decode is believed.
 
+## Integrity
+
+Both CRC-32s a UDIF image carries are **verified on read**, on every image and
+not only on ones this package wrote:
+
+| | span | catches |
+|---|---|---|
+| koly `dataForkChecksum` | the compressed bytes at `dataForkOffset`, `dataForkLength` of them | damage to the stored bytes, whatever the codec |
+| blkx `UDIFChecksum` | that table's own sectors, `sectorNumber..+sectorCount` | sectors that came out wrong from bytes that were intact |
+
+Both are plain `crc32.ChecksumIEEE`, measured against nine images `hdiutil`
+wrote — UDCO, UDZO, UDBZ and ULFO, from 4 KiB to 40 MiB.
+
+The fork checksum is the one that matters most, because **ADC and LZFSE carry no
+internal check at all**: without it a damaged run of either decodes to whatever
+it decodes to. zlib's own Adler-32 does not save a zlib run either —
+`io.ReadFull` stops at the output length and never reaches the trailer. Measured
+before this was enforced: one flipped byte in a 5 KiB UDZO gave back a 900 KiB
+image with a different SHA-256, the right length, and **no error**.
+
+`masterChecksum` is documented as CRC-32 over every uncompressed sector byte and
+is **not** enforced: every image available to measure against leaves its slot
+empty, `hdiutil` included, so there is no witness for that one and this package
+does not pretend to know it.
+
 ## Public API
 
 ```go
@@ -79,7 +104,7 @@ func IsUDIF(path string) bool
 // ConvertUDIF reads all sectors from src and writes them to dst in dstFormat.
 // Supported write formats: UDRW, UDRO, UDSP (sparse), UDZO (zlib-compressed).
 // UDCO, UDBZ and ULFO can be read but not written, and are refused by name.
-// Checksums (CRC-32) are written in the output koly and blkx headers.
+// Checksums (CRC-32) are written in the output blkx headers.
 // Multi-segment images are not supported for reading and return an error.
 func ConvertUDIF(src, dst, dstFormat string) error
 
