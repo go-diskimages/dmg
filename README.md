@@ -72,13 +72,27 @@ flavour uses before its decode is believed.
 Both CRC-32s a UDIF image carries are **verified on read**, on every image and
 not only on ones this package wrote:
 
-| | span | catches |
+| | covers | catches |
 |---|---|---|
 | koly `dataForkChecksum` | the compressed bytes at `dataForkOffset`, `dataForkLength` of them | damage to the stored bytes, whatever the codec |
-| blkx `UDIFChecksum` | that table's own sectors, `sectorNumber..+sectorCount` | sectors that came out wrong from bytes that were intact |
+| blkx `UDIFChecksum` | **the bytes that table's producing runs put in the image** | sectors that came out wrong from bytes that were intact |
 
-Both are plain `crc32.ChecksumIEEE`, measured against nine images `hdiutil`
-wrote — UDCO, UDZO, UDBZ and ULFO, from 4 KiB to 40 MiB.
+Both are plain `crc32.ChecksumIEEE`.
+
+**A zero-fill run contributes nothing to the blkx checksum** — not its sectors and
+not zeros standing in for them. The writer computes the value over what it
+compresses, and a zero-fill chunk compresses nothing. Measured on a UDZO whose
+table mixes the two: three zlib runs and two `IGNORE` runs over 8192 sectors,
+declared `0xe614f115`, which is the CRC-32 of the 1 073 664 bytes the three zlib
+runs produce and of nothing else — `0x86ff7e28` over all 8192 sectors.
+
+That distinction is easy to miss and was missed here once. Nine `hdiutil` images
+agreed with the simpler "all this table's sectors" rule, and **every one of them
+turned out to contain no zero-fill run at all**: `hdiutil` emits one only when it
+recognises the filesystem inside and can see its unused space, so converting a
+raw file never produces one however large or however compressible. `IGNORE` is the
+witnessed case; `NOCOPY` and `FREE` are treated the same way on the same argument,
+with no image available here to confirm it, and the code says so.
 
 The fork checksum is the one that matters most, because **ADC and LZFSE carry no
 internal check at all**: without it a damaged run of either decodes to whatever
