@@ -30,7 +30,7 @@ import (
 
 	"github.com/go-compressions/lzfse"
 
-	"github.com/go-diskimages/dmg/adc"
+	"github.com/go-compressions/adc"
 )
 
 // osStatFile is the function used to stat an open file. Overridable in tests.
